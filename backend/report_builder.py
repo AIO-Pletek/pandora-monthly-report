@@ -1,27 +1,25 @@
 """
 Monthly report builder — generates .docx matching reference format.
 
-Reference format (extracted from user-provided .docx):
+Reference format (from user-provided .docx):
   - Title: "Resources Usage Metric Report" (Arial 24pt bold)
   - Subtitle: "Report Period: <Month Year>" (Arial 14pt)
   - Table (2 cols): "Item" | "Usage Metric"
     - Per VM: "Virtual Machine" | agent alias (bold)
-    - Per metric: metric display name | line chart PNG showing values
+    - Per metric: metric display name | line chart PNG
 
-Uses ``python-docx`` for document and ``matplotlib`` (Agg backend)
-for line charts rendered to PNG, embedded into table cells.
+Uses ``python-docx`` + ``matplotlib`` (Agg backend).
 """
 
 from __future__ import annotations
 
-import calendar
-import io
 import logging
 import os
 import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # ── matplotlib MUST use Agg backend first ──────────────────────────
 import matplotlib
@@ -32,7 +30,7 @@ import matplotlib.ticker as mticker        # noqa: E402
 
 from docx import Document                  # noqa: E402
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # noqa: E402
-from docx.shared import Inches, Pt, RGBColor, Emu  # noqa: E402
+from docx.shared import Inches, Pt, RGBColor  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -44,60 +42,78 @@ CHART_H_INCHES = 2.2
 COLOR_CPU = "#0D6EFD"
 COLOR_MEM = "#198754"
 COLOR_DISK = "#DC3545"
-COLOR_DEFAULT = "#6C757D"
+COLOR_EXTRA = "#6C757D"
+EXTRA_COLORS = ["#FD7E14", "#6F42C1", "#20C997", "#0DCAF0", "#FFC107"]
 
 FONT_FAMILY = "DejaVu Sans"
 
-# Metric name pattern → display name + chart color
-_METRIC_PATTERNS: list[tuple[str, str, str]] = [
-    # (regex, display_name, color)
-    (r"(?i)cpu|processor|utilization|load|usage.*cpu", "CPU Utilization", COLOR_CPU),
-    (r"(?i)mem|ram|memory", "Memory Usage", COLOR_MEM),
-    (r"(?i)disk.*[c][:/]|storage.*[c][:/]|diskused.*[c]", "Disk C:/", COLOR_DISK),
-    (r"(?i)disk.*[d][:/]|storage.*[d][:/]|diskused.*[d]", "Disk D:/", COLOR_DISK),
-    (r"(?i)disk.*[e][:/]|diskused.*[e]", "Disk E:/", COLOR_DISK),
-    (r"(?i)disk|storage|diskused_", "Disk", COLOR_DISK),
+# Position-based metric display names (modules sorted by ID ascending).
+_POSITION_LABELS = [
+    "CPU Utilization",
+    "Memory Usage",
+    "Disk C:/",
+    "Disk D:/",
+    "Disk E:/",
+    "Disk F:/",
+    "Metric 7",
+    "Metric 8",
+]
+
+_POSITION_COLORS = [
+    COLOR_CPU,   # CPU
+    COLOR_MEM,   # Memory
+    COLOR_DISK,  # Disk C
+    COLOR_DISK,  # Disk D
+    COLOR_DISK,  # Disk E
+    *EXTRA_COLORS,
 ]
 
 
-def _classify_metric(data_parts: list[str]) -> tuple[str, str]:
-    """Guess metric type from value patterns.
+def _label_for_position(pos: int) -> tuple[str, str]:
+    """Return (display_name, color) for a module at the given position."""
+    if pos < len(_POSITION_LABELS):
+        label = _POSITION_LABELS[pos]
+    else:
+        label = f"Metric {pos + 1}"
+    color = _POSITION_COLORS[pos] if pos < len(_POSITION_COLORS) else COLOR_EXTRA
+    return label, color
 
-    Pandora Community Ed gives us no module name — only values.
-    We classify by value characteristics:
-      - CPU: typically 0–100 (percentage)
-      - Memory/Disk: large numbers (KB/bytes/counts)
 
-    Returns (display_name, color).
+def _classify_smart(
+    data_points: list[dict[str, Any]],
+    position: int,
+) -> tuple[str, str]:
+    """Classify a module using position + value-range heuristic.
+
+    - Position 0 → CPU always
+    - Position 1 → Memory always
+    - Position 2+ → Disk C:/, D:/, E:/, etc.
+    - If value range doesn't match position (e.g., pos=0 but max=5000),
+      adjust the label suffix but not the category.
     """
-    if not data_parts:
-        return ("Metric", COLOR_DEFAULT)
+    label, color = _label_for_position(position)
 
-    # Extract values (every other item: ts, value, ts, value, ...)
-    vals = []
-    for i, part in enumerate(data_parts):
-        if i % 2 == 1:  # odd positions are values
-            try:
-                vals.append(float(part))
-            except ValueError:
-                pass
+    if not data_points:
+        return label, color
 
+    vals = [p["value"] for p in data_points if p.get("value") is not None]
     if not vals:
-        return ("Metric", COLOR_DEFAULT)
+        return label, color
 
-    avg = sum(vals) / len(vals)
     max_val = max(vals)
 
-    # All values 0–100 → likely CPU %
-    if max_val <= 100:
-        return ("CPU Utilization", COLOR_CPU)
+    # Position 0 (CPU): values should be 0-100%
+    if position == 0 and max_val > 100:
+        # Higher than CPU range — could be something else, keep label
+        pass
 
-    # Values in typical memory range (GB → large numbers)
-    if avg > 1000:
-        return ("Memory Usage", COLOR_MEM)
+    # Position 1 (Memory): values typically >100, add unit hint
+    if position == 1:
+        if max_val < 100:
+            # Low values — might actually be another CPU-like metric
+            pass
 
-    # Mid-range → likely disk
-    return ("Disk", COLOR_DISK)
+    return label, color
 
 
 # ── Chart generation ──────────────────────────────────────────────────────
@@ -126,35 +142,32 @@ _setup_style()
 
 
 def generate_metric_chart(
-    data_parts: list[str],
+    data_points: list[dict[str, Any]],
     label: str,
     color: str,
     output_path: str | Path,
 ) -> str | None:
-    """Generate a line chart for one metric module.
+    """Generate a line chart from pre-parsed data points.
 
-    ``data_parts`` is a list of alternating ``utimestamp`` and ``value``
-    strings from Pandora's raw module_data response.
+    Args:
+        data_points: List of ``{timestamp: datetime, value: float}`` dicts.
+        label: Y-axis label.
+        color: Line color.
+        output_path: Where to save the PNG.
 
-    Returns the absolute path to the saved PNG, or None if no valid data.
+    Returns:
+        Absolute path to the saved PNG, or None if no valid data.
     """
-    if not data_parts or len(data_parts) < 2:
+    if not data_points:
         return None
 
-    # Parse: even indices = timestamps, odd indices = values
-    timestamps: list[datetime] = []
-    values: list[float] = []
+    # Sort by timestamp
+    sorted_pts = sorted(data_points, key=lambda p: p.get("timestamp", datetime.min))
 
-    for i in range(0, len(data_parts) - 1, 2):
-        try:
-            ts = datetime.fromtimestamp(int(data_parts[i]))
-            val = float(data_parts[i + 1])
-            timestamps.append(ts)
-            values.append(val)
-        except (ValueError, OSError):
-            continue
+    timestamps = [p["timestamp"] for p in sorted_pts]
+    values = [p["value"] for p in sorted_pts]
 
-    if not timestamps:
+    if not timestamps or len(timestamps) < 2:
         return None
 
     fig, ax = plt.subplots(figsize=(CHART_W_INCHES, CHART_H_INCHES))
@@ -162,19 +175,22 @@ def generate_metric_chart(
     ax.plot(timestamps, values, color=color, linewidth=1.2, marker=None)
     ax.fill_between(timestamps, values, alpha=0.08, color=color)
 
-    # Formatting
-    ax.set_ylabel(label, color=color, fontweight="bold")
+    # Y-axis label
+    ax.set_ylabel(label, color=color, fontsize=7, fontweight="bold")
+
+    # X-axis date formatting
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=7))
+    locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
+    ax.xaxis.set_major_locator(locator)
+
+    # Y-axis
     ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=4))
 
-    # Add avg line
-    if values:
-        avg = sum(values) / len(values)
-        unit = "%" if max(values) <= 100 else ""
-        ax.axhline(y=avg, color=color, linestyle="--", linewidth=0.7, alpha=0.5)
-        ax.text(timestamps[-1], avg, f"  avg {avg:.1f}{unit}",
-                fontsize=6, color=color, va="center", alpha=0.8)
+    # Average line
+    avg = sum(values) / len(values)
+    ax.axhline(y=avg, color=color, linestyle="--", linewidth=0.7, alpha=0.5)
+    ax.text(timestamps[-1], avg, f"  avg {avg:.1f}",
+            fontsize=6, color=color, va="center", alpha=0.8)
 
     fig.autofmt_xdate()
     fig.tight_layout(pad=0.5)
@@ -186,20 +202,7 @@ def generate_metric_chart(
 # ── Document builder ──────────────────────────────────────────────────────
 
 class ReportBuilder:
-    """Builds the Resources Usage Metric Report .docx matching reference format.
-
-    Usage::
-
-        builder = ReportBuilder(
-            tenant_name="PT Asuransi Central Asia [ACA]",
-            period="Mei 2026",
-            output_dir=Path(".../output"),
-        )
-        for agent in agents:
-            modules = await client.discover_agent_modules(agent["id_agente"])
-            builder.add_vm_block(agent, modules)
-        path = builder.save("ACA_Mei_2026")
-    """
+    """Builds the Resources Usage Metric Report .docx."""
 
     def __init__(
         self,
@@ -216,23 +219,24 @@ class ReportBuilder:
         self._chart_paths: list[str] = []
         self._vm_count = 0
 
-        # Page setup — portrait A4, moderate margins
+        # Page setup — portrait A4
         section = self.doc.sections[0]
         section.top_margin = Inches(0.7)
         section.bottom_margin = Inches(0.7)
         section.left_margin = Inches(0.9)
         section.right_margin = Inches(0.9)
 
-        # Style
+        # Default style
         style = self.doc.styles["Normal"]
         style.font.name = "Arial"
         style.font.size = Pt(10)
 
         self._add_header()
 
+    # ── Header ────────────────────────────────────────────────────────
+
     def _add_header(self) -> None:
-        """Title + subtitle matching reference format."""
-        # Title
+        """Title + subtitle + tenant name."""
         title = self.doc.add_paragraph()
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = title.add_run("Resources Usage Metric Report")
@@ -241,10 +245,8 @@ class ReportBuilder:
         run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
         run.font.name = "Arial"
 
-        # Spacer
         self.doc.add_paragraph("")
 
-        # Subtitle
         sub = self.doc.add_paragraph()
         sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = sub.add_run(f"Report Period: {self.period}")
@@ -252,7 +254,6 @@ class ReportBuilder:
         run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
         run.font.name = "Arial"
 
-        # Tenant
         tn = self.doc.add_paragraph()
         tn.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = tn.add_run(self.tenant_name)
@@ -262,23 +263,21 @@ class ReportBuilder:
 
         self.doc.add_paragraph("")
 
-        # Create table: 2 columns
+        # Create table
         self._table = self.doc.add_table(rows=1, cols=2)
         self._table.style = "Table Grid"
-        # Header row
+
         hdr = self._table.rows[0].cells
         hdr[0].text = "Item"
         hdr[1].text = "Usage Metric"
-        for p in hdr[0].paragraphs:
-            for r in p.runs:
-                r.font.size = Pt(12)
-                r.font.bold = True
-                r.font.name = "Arial"
-        for p in hdr[1].paragraphs:
-            for r in p.runs:
-                r.font.size = Pt(12)
-                r.font.bold = True
-                r.font.name = "Arial"
+        for ci in (0, 1):
+            for p in hdr[ci].paragraphs:
+                for r in p.runs:
+                    r.font.size = Pt(12)
+                    r.font.bold = True
+                    r.font.name = "Arial"
+
+    # ── VM block ──────────────────────────────────────────────────────
 
     def add_vm_block(
         self,
@@ -286,75 +285,101 @@ class ReportBuilder:
         modules: list[dict],
         temp_dir: str,
     ) -> None:
-        """Add one VM row + metric chart rows to the table."""
+        """Add one VM row + metric chart rows to the table.
+
+        Args:
+            agent: Agent dict from PandoraClient.
+            modules: List from ``discover_agent_modules()``, each with:
+                ``module_id``, ``data_points``, ``avg``, ``max_val``.
+            temp_dir: Directory for temporary chart PNGs.
+        """
         agent_alias = agent.get("alias", "Unknown")
         agent_name = agent.get("name", "")
-        agent_id = agent.get("id_agente", "?")
 
         # ── VM header row ──────────────────────────────────────────
         vm_row = self._table.add_row()
         vm_label = vm_row.cells[0].paragraphs[0]
-        vm_label_run = vm_label.add_run("Virtual Machine")
-        vm_label_run.font.size = Pt(12)
-        vm_label_run.font.name = "Arial"
+        run = vm_label.add_run("Virtual Machine")
+        run.font.size = Pt(12)
+        run.font.name = "Arial"
 
         vm_value = vm_row.cells[1].paragraphs[0]
-        vm_value_run = vm_value.add_run(agent_alias)
-        vm_value_run.font.size = Pt(12)
-        vm_value_run.font.bold = True
-        vm_value_run.font.name = "Arial"
+        run = vm_value.add_run(agent_alias)
+        run.font.size = Pt(12)
+        run.font.bold = True
+        run.font.name = "Arial"
         if agent_name:
-            vm_value.add_run(f"  [{agent_name}]").font.size = Pt(9)
+            extra = vm_value.add_run(f"  [{agent_name}]")
+            extra.font.size = Pt(9)
 
         self._vm_count += 1
 
-        # ── Module metric rows ─────────────────────────────────────
-        if not modules:
-            # No module data — just add a note
+        # Sort modules by ID (preserves Pandora's creation order)
+        modules_sorted = sorted(modules, key=lambda m: m.get("module_id", 0))
+
+        if not modules_sorted:
             for label in ["CPU Utilization", "Memory Usage", "Disk C:/", "Disk D:/"]:
-                row = self._table.add_row()
-                row.cells[0].paragraphs[0].add_run(label).font.size = Pt(12)
-                no_data = row.cells[1].paragraphs[0]
-                no_data_run = no_data.add_run("No data")
-                no_data_run.font.size = Pt(12)
-                no_data_run.font.italic = True
+                self._add_no_data_row(label)
             return
 
-        # Classify each module and generate chart
-        for mod in modules:
-            parts = mod.get("values", [])
-            module_id = mod.get("module_id", "?")
-            label, color = _classify_metric(parts)
+        # Track which labels we've used to avoid duplicates
+        used_positions: set[str] = set()
+
+        for pos, mod in enumerate(modules_sorted):
+            data_points = mod.get("data_points", [])
+            if not data_points:
+                continue
+
+            label, color = _classify_smart(data_points, pos)
+
+            # Avoid duplicate labels by appending module ID suffix
+            base_label = label
+            suffix = 2
+            while label in used_positions:
+                label = f"{base_label} ({suffix})"
+                suffix += 1
+            used_positions.add(label)
 
             row = self._table.add_row()
 
             # Label cell
             label_cell = row.cells[0].paragraphs[0]
-            label_run = label_cell.add_run(label)
-            label_run.font.size = Pt(12)
-            label_run.font.name = "Arial"
+            run = label_cell.add_run(label)
+            run.font.size = Pt(12)
+            run.font.name = "Arial"
 
             # Chart cell
-            chart_path = Path(temp_dir) / f"_chart_{agent_id}_{module_id}.png"
-            result = generate_metric_chart(parts, label, color, chart_path)
+            chart_path = Path(temp_dir) / f"_chart_{agent.get('id_agente','?')}_{mod.get('module_id','?')}.png"
+            result = generate_metric_chart(data_points, label, color, chart_path)
             if result:
                 self._chart_paths.append(result)
-                # Embed in cell
                 chart_para = row.cells[1].paragraphs[0]
-                chart_run = chart_para.add_run()
-                chart_run.add_picture(str(chart_path), width=Inches(CHART_W_INCHES))
+                run = chart_para.add_run()
+                run.add_picture(str(chart_path), width=Inches(CHART_W_INCHES))
             else:
-                row.cells[1].paragraphs[0].add_run(
-                    "No chart data"
-                ).font.size = Pt(10)
+                no_chart = row.cells[1].paragraphs[0]
+                run = no_chart.add_run("No chart data")
+                run.font.size = Pt(10)
 
-        # Set column widths
+        # Set column widths (apply to all rows)
         for row_obj in self._table.rows:
             row_obj.cells[0].width = Inches(1.8)
             row_obj.cells[1].width = Inches(6.0)
 
+    def _add_no_data_row(self, label: str) -> None:
+        """Add a row showing 'No data' for a metric."""
+        row = self._table.add_row()
+        run = row.cells[0].paragraphs[0].add_run(label)
+        run.font.size = Pt(12)
+        run.font.name = "Arial"
+        run = row.cells[1].paragraphs[0].add_run("No data")
+        run.font.size = Pt(12)
+        run.font.italic = True
+
+    # ── Save ──────────────────────────────────────────────────────────
+
     def save(self, filename_stem: str) -> str:
-        """Save document and return path."""
+        """Save document to output_dir and return path."""
         safe = _safe_filename(filename_stem)
         path = self.output_dir / f"{safe}.docx"
         i = 1
@@ -365,7 +390,6 @@ class ReportBuilder:
         self.doc.save(str(path))
         logger.info("Saved report: %s (%d VMs)", path, self._vm_count)
 
-        # Cleanup chart files
         for cp in self._chart_paths:
             try:
                 os.unlink(cp)
@@ -387,11 +411,10 @@ def build_report(
     """Generate the Resources Usage Metric Report.
 
     Args:
-        tenant_name: E.g. "PT Asuransi Central Asia [ACA]"
-        period: E.g. "Mei 2026"
-        agents: List of agent dicts from PandoraClient.
-        agent_modules_map: ``{agent_id: [module_dict, ...]}`` from
-            ``PandoraClient.discover_agent_modules()``.
+        tenant_name: E.g. "PT Asuransi Central Asia [ACA]".
+        period: E.g. "Mei 2026".
+        agents: List of agent dicts.
+        agent_modules_map: ``{agent_id: [module_dict, ...]}`` per agent.
         output_dir: Where to save the .docx.
 
     Returns:
@@ -407,10 +430,10 @@ def build_report(
             output_dir=out,
         )
         for agent in agents:
-            agent_id_raw = agent.get("id_agente")
-            if agent_id_raw is None:
+            aid_raw = agent.get("id_agente")
+            if aid_raw is None:
                 continue
-            aid = int(agent_id_raw)
+            aid = int(aid_raw)
             mods = agent_modules_map.get(aid, [])
             builder.add_vm_block(agent, mods, tmpdir)
 

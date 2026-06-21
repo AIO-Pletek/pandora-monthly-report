@@ -99,6 +99,36 @@ def _parse_pandora_timestamp(ts_str: str) -> datetime | None:
         return None
 
 
+def _parse_module_data_tokens(raw_text: str) -> list[dict[str, Any]]:
+    """Parse Pandora's raw module_data response into structured points.
+
+    Pandora Community Ed returns space-separated tokens where each token
+    is the 10-digit Unix timestamp concatenated with the float value,
+    WITHOUT any delimiter between them.
+
+    Example: ``"178201193295.27000 178197564795.26000"``
+      → ``[{timestamp: datetime(2026,6,20,...), value: 95.27}, ...]``
+
+    Returns empty list if parsing fails.
+    """
+    tokens = raw_text.strip().split()
+    points: list[dict[str, Any]] = []
+    for token in tokens:
+        token = token.strip()
+        if len(token) < 12:  # need at least 10-digit ts + 1 digit value + dot
+            continue
+        try:
+            ts_str = token[:10]
+            val_str = token[10:]
+            ts_int = int(ts_str)
+            val = float(val_str)
+            dt = datetime.fromtimestamp(ts_int)
+            points.append({"timestamp": dt, "value": val, "utimestamp": ts_int})
+        except (ValueError, OSError):
+            continue
+    return points
+
+
 # ── Client ───────────────────────────────────────────────────────────────────
 
 class PandoraClient:
@@ -630,6 +660,9 @@ class PandoraClient:
         around a known ``id_agentmodule`` from events reveals all
         modules belonging to this agent.
 
+        Each token from Pandora is ``timestamp(10) + value`` concatenated
+        without delimiter, e.g. ``178201193295.27000`` → ts=1782011932, val=95.27.
+
         Args:
             agent_id: Pandora agent ID.
             scan_range: How many IDs to scan in each direction.
@@ -637,8 +670,9 @@ class PandoraClient:
         Returns:
             List of module dicts with keys:
               - ``module_id`` (int)
-              - ``values`` (list[str]) — raw value strings from module_data
-              - ``data_points`` (int) — count of data points returned
+              - ``data_points`` (list of dicts: ``{timestamp, value}``)
+              - ``avg`` (float) — average value
+              - ``max_val`` (float) — maximum value
         """
         known_ids = await self.get_agent_module_ids(agent_id)
         if not known_ids:
@@ -655,24 +689,29 @@ class PandoraClient:
                 raw = await self._raw_module_data(mid)
             except PandoraAPIError:
                 continue
-            if not raw or raw.startswith("No data"):
+            if not raw:
                 continue
-            # Parse the data: "timestampvalue timestampvalue ..."
-            parts = raw.strip().split()
-            if len(parts) >= 2:  # need at least 1 data point
-                found.append({
-                    "module_id": mid,
-                    "values": parts,
-                    "data_points": len(parts),
-                })
+            points = _parse_module_data_tokens(raw)
+            if not points:
+                continue
+            avg = sum(p["value"] for p in points) / len(points)
+            max_val = max(p["value"] for p in points)
+            found.append({
+                "module_id": mid,
+                "data_points": points,
+                "count": len(points),
+                "avg": avg,
+                "max_val": max_val,
+            })
 
         return found
 
     async def _raw_module_data(self, module_id: int) -> str:
         """Fetch raw module_data text without parsing.
 
-        Community Edition returns space-separated ``utimestampvalue``
-        pairs (e.g. ``178201193295.27000``) — no JSON wrapper.
+        Community Edition returns space-separated ``utimestamp+value``
+        concatenated tokens (e.g. ``178201193295.27000`` — no delimiter
+        between the 10-digit timestamp and the float value).
         """
         params: dict[str, Any] = {
             "op": "get",
@@ -687,6 +726,6 @@ class PandoraClient:
             resp = await client.get(self.base_url, params=params)
             resp.raise_for_status()
         text = resp.text.strip()
-        if not text or text.startswith("No data"):
+        if not text or text.lower().startswith("no data"):
             return ""
         return text
