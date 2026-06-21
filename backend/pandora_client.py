@@ -287,25 +287,45 @@ class PandoraClient:
     async def get_module_groups(self) -> list[dict]:
         """Return module groups from Pandora Community Edition.
 
-        Returns CSV-parsed list with keys ``id``, ``name``.
-        Example: ``[{"id":"1","name":"General"}, ...]``
+        Pandora returns CSV WITHOUT a header row — every line is ``id;name``.
+        e.g.::
+            1;General
+            2;Networking
+            ...
 
-        In Community Edition, this is the ONLY source of group listing.
+        Returns list of dicts with ``id`` (int) and ``name`` (str).
         """
-        rows = await self._call("module_groups", expect_csv=True)
-        # Normalize keys — CSV header is "id_agente_modulo;nombre" style
+        raw_text = ""
+        params: dict[str, Any] = {
+            "op": "get",
+            "op2": "module_groups",
+            "user": self.api_user,
+            "pass": self.api_pass,
+            "apipass": self.api_password,
+            "return_type": "csv",
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(self.base_url, params=params)
+            resp.raise_for_status()
+        raw_text = resp.text.strip()
+
+        if not raw_text:
+            return []
+
         result: list[dict] = []
-        for row in rows:
-            # Keys vary by version; normalize to {"id", "name"}
-            gid = row.get(next((k for k in row if "id" in k.lower()), ""), "")
-            name = row.get(next((k for k in row if "nom" in k.lower() or "name" in k.lower()), ""), "")
-            if not name:
-                # Some versions have just "id;name" as headers
-                keys = list(row.keys())
-                gid = row.get(keys[0], "") if len(keys) > 0 else ""
-                name = row.get(keys[1], "") if len(keys) > 1 else ""
-            if name:
-                result.append({"id": gid, "name": name})
+        for line in raw_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(";")
+            if len(parts) >= 2 and parts[0].isdigit():
+                try:
+                    result.append({
+                        "id": int(parts[0]),
+                        "name": parts[1],
+                    })
+                except (ValueError, IndexError):
+                    pass
         return result
 
     async def get_groups_with_agents(self) -> list[dict]:
@@ -370,31 +390,86 @@ class PandoraClient:
     async def get_groups(self) -> list[dict]:
         """Return all groups (tenants) for UI dropdown.
 
-        Tries in order:
-          1. Groups extracted from events (has agent mapping).
-          2. Module groups (fallback, no agent mapping).
+        Merges two sources:
+          1. Groups extracted from events (has agent mapping + real names).
+          2. Module groups from ``module_groups`` (structural groups).
 
-        Returns list of dicts with ``id`` and ``name`` keys.
+        Returns list of dicts with ``id``, ``name``, ``agent_count``.
         """
-        # Primary: groups from events (best mapping)
-        try:
-            groups = await self.get_groups_with_agents()
-            if groups:
-                logger.info("Got %d groups from events", len(groups))
-                return groups
-        except PandoraAPIError:
-            logger.info("Could not get groups from events, trying module_groups")
+        merged: dict[int, dict] = {}
 
-        # Fallback: module groups
+        # Source 1: module_groups (structural — all groups)
         try:
-            groups = await self.get_module_groups()
-            if groups:
-                logger.info("Got %d groups from module_groups", len(groups))
-                return groups
+            mgroups = await self.get_module_groups()
+            for g in mgroups:
+                gid = g.get("id", "")
+                try:
+                    gid_int = int(gid)
+                except (ValueError, TypeError):
+                    continue
+                merged[gid_int] = {
+                    "id": gid_int,
+                    "name": g.get("name", f"Group {gid_int}"),
+                    "agent_ids": [],
+                }
+            logger.info("Got %d groups from module_groups", len(mgroups))
         except PandoraAPIError:
-            logger.warning("module_groups also failed")
+            logger.info("module_groups failed")
 
-        return []
+        # Source 2: events (enriches with real group names + agent mapping)
+        try:
+            agents = await self.get_agents()
+            events = await self._call("events")
+            if isinstance(events, dict) and "data" in events:
+                events = events["data"]
+            if not isinstance(events, list):
+                events = []
+
+            agent_group: dict[int, set[int]] = defaultdict(set)
+            for evt in events:
+                if not isinstance(evt, dict):
+                    continue
+                aid = evt.get("id_agente")
+                gid = evt.get("id_grupo")
+                if aid and gid:
+                    try:
+                        agent_group[int(aid)].add(int(gid))
+                    except (ValueError, TypeError):
+                        pass
+
+            for evt in events:
+                if not isinstance(evt, dict):
+                    continue
+                gid = evt.get("id_grupo")
+                gname = evt.get("group_name", "")
+                if gid:
+                    try:
+                        gid_int = int(gid)
+                    except (ValueError, TypeError):
+                        continue
+                    if gid_int not in merged:
+                        merged[gid_int] = {
+                            "id": gid_int,
+                            "name": gname or f"Group {gid_int}",
+                            "agent_ids": [],
+                        }
+                    elif gname and merged[gid_int]["name"].startswith("Group "):
+                        merged[gid_int]["name"] = gname
+
+            # Count total agents (Community Ed: agent→group from events only)
+            for aid, gids in agent_group.items():
+                for gid in gids:
+                    if gid in merged:
+                        merged[gid]["agent_ids"].append(aid)
+            for g in merged.values():
+                g["agent_ids"] = sorted(set(g["agent_ids"]))
+                g["agent_count"] = len(g["agent_ids"])
+        except PandoraAPIError:
+            logger.info("Could not enrich groups from events")
+
+        result = sorted(merged.values(), key=lambda g: str(g.get("name", "")))
+        logger.info("get_groups: %d total groups", len(result))
+        return result
 
     # -- 3.3  Agents ----------------------------------------------------
 
@@ -419,52 +494,17 @@ class PandoraClient:
     async def get_agents_for_group(
         self, id_group: int,
     ) -> list[dict]:
-        """Return agents that belong to a specific group.
+        """Return ALL agents for report generation.
 
-        Since Community Edition has no server-side agent→group filter,
-        this method fetches all agents + all events, then filters
-        agents whose events appear in ``id_group``.
+        Pandora Community Edition has NO server-side agent→group filter
+        and events (40 items) are too sparse to reliably map agents to
+        groups.  Therefore we return all agents for every group — the
+        report will list all monitored VMs.
 
         Args:
-            id_group: Group ID (from events' ``id_grupo``).
-
-        Returns:
-            List of agent dicts (same format as :meth:`get_agents`),
-            filtered to only those with events in this group.
+            id_group: Group ID (used only for logging).
         """
-        agents = await self.get_agents()
-        events = await self._call("events")
-        if not isinstance(events, list):
-            events = []
-
-        # Find which agents have events in this group
-        agent_ids_in_group: set[int] = set()
-        for evt in events:
-            if not isinstance(evt, dict):
-                continue
-            try:
-                evt_group = int(evt.get("id_grupo") or 0)
-                evt_agent = int(evt.get("id_agente") or 0)
-            except (ValueError, TypeError):
-                continue
-            if evt_group == int(id_group) and evt_agent > 0:
-                agent_ids_in_group.add(evt_agent)
-
-        if not agent_ids_in_group:
-            logger.warning(
-                "No agents found for group %s (no events in this group)", id_group
-            )
-            return []
-
-        result = []
-        for agent in agents:
-            try:
-                aid = int(agent.get("id_agente") or 0)
-            except (ValueError, TypeError):
-                continue
-            if aid in agent_ids_in_group:
-                result.append(agent)
-        return result
+        return await self.get_agents()
 
     # -- 3.4  Module data -----------------------------------------------
 
