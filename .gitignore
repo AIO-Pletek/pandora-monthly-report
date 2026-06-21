@@ -4,6 +4,7 @@
 # Generated reports — temporary files
 backend/output/
 !backend/output/.gitkeep
+*.docx
 
 # Python
 __pycache__/
