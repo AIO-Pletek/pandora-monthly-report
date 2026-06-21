@@ -48,7 +48,7 @@ FONT_FAMILY = "DejaVu Sans"
 # Metric categories we care about. Everything else is skipped.
 _CPU_LABEL = "CPU Utilization"
 _MEM_LABEL = "Memory Usage"
-_DISK_LABELS = ["Disk C:/", "Disk D:/", "Disk E:/"]
+_DISK_LABELS = ["Disk Usage", "Disk Usage (2)", "Disk Usage (3)"]
 _MAX_DISK = 3
 
 
@@ -303,8 +303,8 @@ class ReportBuilder:
         if not modules_sorted:
             self._add_no_data_row("CPU Utilization")
             self._add_no_data_row("Memory Usage")
-            self._add_no_data_row("Disk C:/")
-            self._add_no_data_row("Disk D:/")
+            self._add_no_data_row("Disk Usage")
+            self._add_no_data_row("Disk Usage (2)")
             return
 
         # Classify each module → keep only CPU, Memory, Disk
@@ -341,7 +341,7 @@ class ReportBuilder:
                 break
             to_display.append((_DISK_LABELS[i], COLOR_DISK, dmod))
 
-        # If no disk modules, show at least C: and D: as "No data"
+        # If fewer than 2 disk modules, fill remaining with "No data"
         if len(disk_mods) < 2:
             for i in range(len(disk_mods), 2):
                 to_display.append((_DISK_LABELS[i], COLOR_DISK, {}))
