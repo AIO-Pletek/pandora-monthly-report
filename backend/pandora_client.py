@@ -245,48 +245,59 @@ class PandoraClient:
         if not text:
             return []
 
-        # Try JSON first.
+        # ── Response parsing strategy ──────────────────────────────────
+        # Pandora v7.0 NG IGNORES return_type=json and always returns CSV
+        # (semicolon-delimited, header row + data rows).  Other versions
+        # return real JSON.  To handle both:
+        #   1. If text looks like CSV (contains ';' or matches test format),
+        #      parse as CSV FIRST.
+        #   2. Otherwise, try JSON.
+        #   3. If JSON succeeds but is suspect (plain string, list of
+        #      strings that look like error), re-parse as CSV or reject.
+
+        looks_like_csv = (
+            ";" in text
+            or (op2 == "test" and "," in text and "\n" not in text)
+        )
+
+        if looks_like_csv:
+            # ── CSV path ───────────────────────────────────────────
+            if op2 == "test":
+                logger.info("Pandora returned CSV for test — parsing")
+                return _parse_test_response(text)
+
+            logger.debug(
+                "Pandora op2=%s looks like CSV — parsing as semicolon CSV",
+                op2,
+            )
+            csv_data = _parse_pandora_csv(text, delimiter=";")
+            if csv_data:
+                return csv_data
+            # If semicolon failed, try comma
+            csv_data = _parse_pandora_csv(text, delimiter=",")
+            if csv_data:
+                return csv_data
+
+        # ── JSON path (fallback) ───────────────────────────────────────
         try:
             data = resp.json()
         except json.JSONDecodeError:
-            pass  # not JSON — try CSV
-        else:
-            # Check for error messages disguised as valid JSON.
-            # Pandora returns e.g. ["This operation does not exist."]
-            if _is_error_response(data, op2):
+            # Not JSON either — if CSV was attempted and failed, give up.
+            if looks_like_csv:
                 raise PandoraAPIError(
-                    f"Pandora rejected op2={op2}: {_format_error(data)}"
+                    f"Pandora returned CSV-like text but parse failed "
+                    f"for op2={op2}: {text[:500]}"
                 )
-            return data
+            raise PandoraAPIError(
+                f"Pandora returned non-JSON for op2={op2}: {text[:500]}"
+            )
 
-        # Pandora v7.0 NG often ignores return_type=json and returns CSV.
-        # The CSV format varies by operation:
-        #   - op2=test: single CSV line "status,version,build"
-        #   - other op2: header row + data rows, semicolon-delimited
-        if op2 == "test":
-            logger.info("Pandora returned CSV for test — parsing manually")
-            return _parse_test_response(text)
-
-        # Attempt generic CSV parse (semicolon is Pandora's default delimiter).
-        logger.warning(
-            "Pandora returned non-JSON for op2=%s — parsing as CSV. "
-            "First 200 chars: %s",
-            op2, text[:200],
-        )
-        csv_data = _parse_pandora_csv(text, delimiter=";")
-        if csv_data:
-            return csv_data
-
-        # If CSV parsing also failed, check if it's comma-separated CSV.
-        if "," in text[:200]:
-            csv_data_comma = _parse_pandora_csv(text, delimiter=",")
-            if csv_data_comma:
-                return csv_data_comma
-
-        raise PandoraAPIError(
-            f"Pandora returned unrecognized format for op2={op2}: "
-            f"{text[:500]}"
-        )
+        # Validate JSON response
+        if _is_error_response(data, op2):
+            raise PandoraAPIError(
+                f"Pandora rejected op2={op2}: {_format_error(data)}"
+            )
+        return data
 
     # ── Public API wrappers ────────────────────────────────────────────
 
