@@ -350,15 +350,35 @@ class PandoraClient:
 
         Internal-only — normal code MUST use :meth:`get_agents_by_group`
         with an explicit ``id_group``.
+
+        Always passes ``other_mode=url_encode_separator_|`` to force CSV
+        output (Pandora v7.0 NG ignores ``return_type=json``). The empty
+        ``other`` string returns all agents across all groups.
         """
         try:
-            agents = await self._call("all_agents")
+            agents = await self._call(
+                "all_agents",
+                extra_params={
+                    "other": "||||||0",
+                    "other_mode": "url_encode_separator_|",
+                },
+            )
         except PandoraAPIError:
             logger.exception("all_agents without filter also failed")
             return []
 
+        # Safety: if _call somehow returned non-list, bail out.
+        if not isinstance(agents, list):
+            logger.error(
+                "_get_groups_from_agents: expected list, got %s",
+                type(agents).__name__,
+            )
+            return []
+
         groups: dict[int, dict] = {}
         for agent in agents:
+            if not isinstance(agent, dict):
+                continue
             gid = (
                 agent.get("id_grupo")
                 or agent.get("id_group")
