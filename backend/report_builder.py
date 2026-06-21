@@ -331,25 +331,23 @@ class ReportBuilder:
         used_positions: set[str] = set()
 
         for pos, mod in enumerate(modules_sorted):
-            data_points = mod.get("data_points", [])
-            if not data_points:
-                continue
+            all_points = mod.get("data_points", [])
+            label, color = _classify_smart(all_points, pos)
 
-            # Filter to selected month only
-            if self._ts_start is not None and self._ts_end is not None:
-                data_points = _filter_by_month(data_points, self._ts_start, self._ts_end)
-            if not data_points:
-                continue
-
-            label, color = _classify_smart(data_points, pos)
-
-            # Avoid duplicate labels by appending module ID suffix
+            # Deduplicate labels
             base_label = label
             suffix = 2
             while label in used_positions:
                 label = f"{base_label} ({suffix})"
                 suffix += 1
             used_positions.add(label)
+
+            # Filter to selected month
+            in_month = []
+            if all_points and self._ts_start is not None and self._ts_end is not None:
+                in_month = _filter_by_month(all_points, self._ts_start, self._ts_end)
+            elif all_points:
+                in_month = all_points
 
             row = self._table.add_row()
 
@@ -360,17 +358,25 @@ class ReportBuilder:
             run.font.name = "Arial"
 
             # Chart cell
-            chart_path = Path(temp_dir) / f"_chart_{agent.get('id_agente','?')}_{mod.get('module_id','?')}.png"
-            result = generate_metric_chart(data_points, label, color, chart_path)
-            if result:
-                self._chart_paths.append(result)
-                chart_para = row.cells[1].paragraphs[0]
-                run = chart_para.add_run()
-                run.add_picture(str(chart_path), width=Inches(CHART_W_INCHES))
+            if in_month and len(in_month) >= 2:
+                chart_path = Path(temp_dir) / f"_chart_{agent.get('id_agente','?')}_{mod.get('module_id','?')}.png"
+                result = generate_metric_chart(in_month, label, color, chart_path)
+                if result:
+                    self._chart_paths.append(result)
+                    chart_para = row.cells[1].paragraphs[0]
+                    run = chart_para.add_run()
+                    run.add_picture(str(chart_path), width=Inches(CHART_W_INCHES))
+                else:
+                    self._add_empty_cell(row.cells[1], "Chart render failed")
+            elif in_month and len(in_month) == 1:
+                # Only 1 data point — show value directly
+                p = in_month[0]
+                val_str = f"{p['value']:.2f}"
+                ts_str = p['timestamp'].strftime("%d %b %Y %H:%M")
+                cell_text = f"Single data point: {val_str}  ({ts_str})"
+                self._add_empty_cell(row.cells[1], cell_text)
             else:
-                no_chart = row.cells[1].paragraphs[0]
-                run = no_chart.add_run("No chart data")
-                run.font.size = Pt(10)
+                self._add_empty_cell(row.cells[1], "No data for this period")
 
         # Set column widths (apply to all rows)
         for row_obj in self._table.rows:
@@ -383,9 +389,17 @@ class ReportBuilder:
         run = row.cells[0].paragraphs[0].add_run(label)
         run.font.size = Pt(12)
         run.font.name = "Arial"
-        run = row.cells[1].paragraphs[0].add_run("No data")
-        run.font.size = Pt(12)
+        self._add_empty_cell(row.cells[1], "No data")
+
+    def _add_empty_cell(self, cell, text: str) -> None:
+        """Fill a cell with placeholder italic text."""
+        p = cell.paragraphs[0]
+        # Clear default empty paragraph content
+        p.clear()
+        run = p.add_run(text)
+        run.font.size = Pt(10)
         run.font.italic = True
+        run.font.color.rgb = RGBColor(0xAD, 0xB5, 0xBD)
 
     # ── Save ──────────────────────────────────────────────────────────
 

@@ -102,8 +102,8 @@ def _parse_pandora_timestamp(ts_str: str) -> datetime | None:
 def _parse_module_data_tokens(raw_text: str) -> list[dict[str, Any]]:
     """Parse Pandora's raw module_data response into structured points.
 
-    Pandora Community Ed returns space-separated tokens where each token
-    is the 10-digit Unix timestamp concatenated with the float value,
+    Pandora Community Ed returns whitespace-separated tokens where each
+    token is a 10-digit Unix timestamp concatenated with the float value,
     WITHOUT any delimiter between them.
 
     Example: ``"178201193295.27000 178197564795.26000"``
@@ -115,13 +115,16 @@ def _parse_module_data_tokens(raw_text: str) -> list[dict[str, Any]]:
     points: list[dict[str, Any]] = []
     for token in tokens:
         token = token.strip()
-        if len(token) < 12:  # need at least 10-digit ts + 1 digit value + dot
+        if len(token) < 11:  # minimum: 10-digit ts + 1-digit value
             continue
         try:
             ts_str = token[:10]
             val_str = token[10:]
             ts_int = int(ts_str)
             val = float(val_str)
+            # Sanity check: timestamp should be in reasonable range
+            if ts_int < 1000000000 or ts_int > 2000000000:
+                continue
             dt = datetime.fromtimestamp(ts_int)
             points.append({"timestamp": dt, "value": val, "utimestamp": ts_int})
         except (ValueError, OSError):
@@ -709,9 +712,11 @@ class PandoraClient:
     async def _raw_module_data(self, module_id: int) -> str:
         """Fetch raw module_data text without parsing.
 
-        Community Edition returns space-separated ``utimestamp+value``
-        concatenated tokens (e.g. ``178201193295.27000`` — no delimiter
-        between the 10-digit timestamp and the float value).
+        Community Edition returns whitespace-separated timestamp+value tokens
+        (e.g. ``178201193295.27000`` -- no delimiter between the 10-digit
+        Unix timestamp and the float value).
+
+        Also unwraps JSON-wrapped error messages some Pandora versions return.
         """
         params: dict[str, Any] = {
             "op": "get",
@@ -726,6 +731,25 @@ class PandoraClient:
             resp = await client.get(self.base_url, params=params)
             resp.raise_for_status()
         text = resp.text.strip()
-        if not text or text.lower().startswith("no data"):
+
+        # Unwrap JSON-wrapped responses: {"type":"string","data":"No data..."}
+        if text.startswith("{"):
+            try:
+                import json as _json
+                data = _json.loads(text)
+                if isinstance(data, dict):
+                    inner = data.get("data") or data.get("error") or ""
+                    if isinstance(inner, str):
+                        text = inner.strip()
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if not text:
             return ""
+        lower = text.lower()
+        if lower.startswith("no data") or "no data to show" in lower:
+            return ""
+        if lower == "error in the parameters.":
+            return ""
+
         return text
