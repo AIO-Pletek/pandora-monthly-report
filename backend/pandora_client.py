@@ -38,6 +38,46 @@ class PandoraAuthError(PandoraAPIError):
     """Raised when Pandora returns 'auth error' — credentials are wrong."""
 
 
+# ── CSV/plain-text helpers ──────────────────────────────────────────────────
+
+def _parse_pandora_csv(text: str, delimiter: str = ";") -> list[dict]:
+    """Parse Pandora CSV response into list of dicts.
+
+    Pandora returns CSV with first line as header and ``delimiter``-separated
+    fields on subsequent lines. Lines are ``\\n``-separated.
+
+    Returns empty list if text is empty or only contains a header row.
+    """
+    lines = text.strip().split("\n")
+    if len(lines) < 2:
+        return []
+    headers = lines[0].split(delimiter)
+    rows: list[dict] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        values = line.split(delimiter)
+        row = {}
+        for i, hdr in enumerate(headers):
+            row[hdr] = values[i] if i < len(values) else ""
+        rows.append(row)
+    return rows
+
+
+def _parse_test_response(text: str) -> dict:
+    """Parse the special CSV response from ``op2=test``.
+
+    Expected format: ``status,version,build``
+    e.g. ``OK,v7.0NG.720,PC180320``
+    """
+    parts = text.strip().split(",")
+    return {
+        "status": parts[0] if len(parts) > 0 else "",
+        "version": parts[1] if len(parts) > 1 else "",
+        "build": parts[2] if len(parts) > 2 else "",
+    }
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _to_module_date(date_str: str) -> str:
     """Convert human-readable date (YYYY-MM-DD) to module_data format.
@@ -162,12 +202,42 @@ class PandoraClient:
         if not text:
             return []
 
+        # Try JSON first.
         try:
-            return resp.json()
+            data = resp.json()
+            # Pandora sometimes wraps JSON in a dict with "error" key.
+            return data
         except json.JSONDecodeError:
-            raise PandoraAPIError(
-                f"Pandora returned non-JSON for op2={op2}: {text[:500]}"
-            )
+            pass  # not JSON — try CSV
+
+        # Pandora v7.0 NG often ignores return_type=json and returns CSV.
+        # The CSV format varies by operation:
+        #   - op2=test: single CSV line "status,version,build"
+        #   - other op2: header row + data rows, semicolon-delimited
+        if op2 == "test":
+            logger.info("Pandora returned CSV for test — parsing manually")
+            return _parse_test_response(text)
+
+        # Attempt generic CSV parse (semicolon is Pandora's default delimiter).
+        logger.warning(
+            "Pandora returned non-JSON for op2=%s — parsing as CSV. "
+            "First 200 chars: %s",
+            op2, text[:200],
+        )
+        csv_data = _parse_pandora_csv(text, delimiter=";")
+        if csv_data:
+            return csv_data
+
+        # If CSV parsing also failed, check if it's comma-separated CSV.
+        if "," in text[:200]:
+            csv_data_comma = _parse_pandora_csv(text, delimiter=",")
+            if csv_data_comma:
+                return csv_data_comma
+
+        raise PandoraAPIError(
+            f"Pandora returned unrecognized format for op2={op2}: "
+            f"{text[:500]}"
+        )
 
     # ── Public API wrappers ────────────────────────────────────────────
 
@@ -178,11 +248,15 @@ class PandoraClient:
 
         Uses ``op2=test``. Does NOT require an ``id`` or ``other`` param.
 
-        Returns a dict with at least ``{"version": "...", ...}``.
+        Pandora v7.0 NG returns CSV ``OK,v7.0NG.720,PC180320`` (not JSON),
+        so this method always returns a properly parsed dict with keys
+        ``status``, ``version``, ``build``.
         """
         result = await self._call("test")
         if isinstance(result, list):
-            # If the API returns a list, wrap it for consistency.
+            return {"data": result}
+        if isinstance(result, dict) and "version" not in result:
+            # got some unexpected dict structure, wrap it
             return {"data": result}
         return result
 
