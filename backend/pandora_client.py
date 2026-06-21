@@ -1,23 +1,29 @@
 """
 Pandora FMS REST API client — read-only wrapper module.
 
-Wraps Pandora FMS External API (op=get) for the operations needed by the
-monthly report generator. Every function that queries agents/events/modules
-MUST accept an explicit id_group parameter and filter server-side.
+Target: Pandora FMS v7.0 NG **Community Edition** (Open Source).
+Verified against real instance June 2026.
 
-Reference: Pandora FMS External API documentation
-  https://pandorafms.com/manual/en/documentation/08_technical_reference/02_annex_externalapi
+Key differences from Enterprise edition:
+  - Agents have NO ``id_grupo`` field (Community has no agent-group mapping).
+  - ``get_agent_modules`` / ``agent_modules`` returns "No modules retrieved".
+  - ``return_type=json`` is RESPECTED (no forced CSV like some older versions).
+  - ``module_groups`` returns CSV, not JSON.
+  - Events contain ``id_grupo`` / ``group_name`` — usable for grouping.
 
-Parameter ordering in `other` is STRICT — wrong order silently returns empty data
-instead of an error. Each function documents the pipe-separated position mapping.
+Strategy:
+  - Groups (tenants) come from ``module_groups`` CSV + events enrichment.
+  - Agents are NOT filterable by group server-side → fetch all, map via events.
+  - Module IDs come from events (``id_agentmodule``), not from agent_modules.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -25,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_TIMEOUT = 30.0  # seconds
-DATE_FMT_MODULE = "%Y%m%dT%H:%M"  # module_data: YYYYMMDDThh:mm
-DATE_FMT_DISPLAY = "%Y-%m-%d"     # human-readable date input
+DATE_FMT_DISPLAY = "%Y-%m-%d"     # human-readable input
+DATE_FMT_DATETIME = "%Y-%m-%d %H:%M:%S"  # Pandora timestamp format
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
@@ -38,15 +44,12 @@ class PandoraAuthError(PandoraAPIError):
     """Raised when Pandora returns 'auth error' — credentials are wrong."""
 
 
-# ── CSV/plain-text helpers ──────────────────────────────────────────────────
+# ── CSV helpers ──────────────────────────────────────────────────────────────
 
 def _parse_pandora_csv(text: str, delimiter: str = ";") -> list[dict]:
-    """Parse Pandora CSV response into list of dicts.
+    """Parse Pandora CSV response (header row + data rows) into list[dict].
 
-    Pandora returns CSV with first line as header and ``delimiter``-separated
-    fields on subsequent lines. Lines are ``\\n``-separated.
-
-    Returns empty list if text is empty or only contains a header row.
+    Returns empty list if text is empty or only a header row.
     """
     lines = text.strip().split("\n")
     if len(lines) < 2:
@@ -57,7 +60,7 @@ def _parse_pandora_csv(text: str, delimiter: str = ";") -> list[dict]:
         if not line.strip():
             continue
         values = line.split(delimiter)
-        row = {}
+        row: dict[str, str] = {}
         for i, hdr in enumerate(headers):
             row[hdr] = values[i] if i < len(values) else ""
         rows.append(row)
@@ -65,11 +68,7 @@ def _parse_pandora_csv(text: str, delimiter: str = ";") -> list[dict]:
 
 
 def _parse_test_response(text: str) -> dict:
-    """Parse the special CSV response from ``op2=test``.
-
-    Expected format: ``status,version,build``
-    e.g. ``OK,v7.0NG.720,PC180320``
-    """
+    """Parse ``op2=test`` CSV: ``OK,v7.0NG.720,PC180320``."""
     parts = text.strip().split(",")
     return {
         "status": parts[0] if len(parts) > 0 else "",
@@ -78,74 +77,13 @@ def _parse_test_response(text: str) -> dict:
     }
 
 
-def _is_error_response(data: dict | list | str, op2: str) -> bool:
-    """Detect Pandora error messages that come back as valid JSON.
-
-    Pandora v7.0 NG returns errors like:
-      - ``["This operation does not exist."]``
-      - ``["No agents found in this group."]``
-      - ``{"error": "..."}``
-
-    Returns True if ``data`` looks like an error, not real data.
-    """
-    # Dict with error key
-    if isinstance(data, dict) and "error" in data:
-        return True
-    # List where all items are strings that look like error messages
-    if isinstance(data, list) and len(data) > 0:
-        all_strings = all(isinstance(item, str) for item in data)
-        if all_strings:
-            error_patterns = [
-                "does not exist",
-                "no such",
-                "not found",
-                "no agents",
-                "error",
-                "invalid",
-                "auth",
-                "acl",
-                "permission",
-            ]
-            combined = " ".join(data).lower()
-            if any(pat in combined for pat in error_patterns):
-                return True
-    return False
-
-
-def _format_error(data) -> str:
-    """Format error response into a readable string."""
-    if isinstance(data, list):
-        return " / ".join(str(item) for item in data)
-    if isinstance(data, dict) and "error" in data:
-        return str(data["error"])
-    return str(data)[:500]
-
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
-def _to_module_date(date_str: str) -> str:
-    """Convert human-readable date (YYYY-MM-DD) to module_data format.
-
-    ``date_str`` can be:
-      - ``"2025-06-01"`` → ``"20250601T00:00"``
-      - ``"20250601T00:00"`` → returned as-is
-    """
-    date_str = date_str.strip()
-    if "T" in date_str:
-        return date_str  # already in API format
-    dt = datetime.strptime(date_str, DATE_FMT_DISPLAY)
-    return dt.strftime(DATE_FMT_MODULE)
-
 
 def _to_unix(date_str: str, end_of_day: bool = False) -> int:
-    """Convert human-readable date to Unix timestamp (int seconds).
-
-    Args:
-        date_str: ``"2025-06-01"`` or ``"2025-06-01T23:59"``
-        end_of_day: if True and only a date is given, set time to 23:59:59.
-    """
+    """Convert human-readable date to Unix timestamp (int seconds)."""
     date_str = date_str.strip()
     try:
-        dt = datetime.strptime(date_str, DATE_FMT_MODULE)
+        dt = datetime.strptime(date_str, "%Y%m%dT%H:%M")
     except ValueError:
         dt = datetime.strptime(date_str, DATE_FMT_DISPLAY)
         if end_of_day:
@@ -153,9 +91,18 @@ def _to_unix(date_str: str, end_of_day: bool = False) -> int:
     return int(dt.timestamp())
 
 
+def _parse_pandora_timestamp(ts_str: str) -> datetime | None:
+    """Parse Pandora's ``YYYY-MM-DD HH:MM:SS`` timestamp format."""
+    try:
+        return datetime.strptime(ts_str.strip(), DATE_FMT_DATETIME)
+    except (ValueError, TypeError):
+        return None
+
+
 # ── Client ───────────────────────────────────────────────────────────────────
+
 class PandoraClient:
-    """Async read-only client for Pandora FMS External API.
+    """Async read-only client for Pandora FMS Community Edition API.
 
     Usage::
 
@@ -167,6 +114,8 @@ class PandoraClient:
         )
         info = await client.test()
         groups = await client.get_groups()
+        agents = await client.get_agents()
+        events = await client.get_events(date_start="2025-06-01", date_end="2025-06-30")
     """
 
     def __init__(
@@ -193,23 +142,22 @@ class PandoraClient:
         id_: str | None = None,
         *,
         timeout: float | None = None,
-    ) -> dict | list:
+        expect_csv: bool = False,
+    ) -> Any:
         """Issue a GET request to the Pandora API.
 
-        All requests include ``op=get``, auth, and ``return_type=json``.
+        All requests include ``op=get``, auth, and ``return_type=json``
+        (unless ``expect_csv`` forces CSV mode).
 
         Args:
-            op2: Operation name (e.g. ``"test"``, ``"all_agents"``).
-            extra_params: Additional query params merged into the request.
-            id_: Value for the ``id`` param (agent id / module id etc.).
-            timeout: Per-call override (seconds).
+            op2: Operation name (e.g. ``"all_agents"``).
+            extra_params: Additional query params.
+            id_: Value for the ``id`` param.
+            timeout: Per-call override.
+            expect_csv: If True, use ``return_type=csv`` and parse as CSV.
 
         Returns:
-            Parsed JSON body — dict or list depending on the operation.
-
-        Raises:
-            PandoraAuthError: Auth rejected by Pandora.
-            PandoraAPIError: Non-200 or JSON-decode failure after body check.
+            Parsed data — dict, list[dict], or parsed CSV list.
         """
         params: dict[str, Any] = {
             "op": "get",
@@ -217,7 +165,7 @@ class PandoraClient:
             "user": self.api_user,
             "pass": self.api_pass,
             "apipass": self.api_password,
-            "return_type": "json",
+            "return_type": "csv" if expect_csv else "json",
         }
         if id_ is not None:
             params["id"] = id_
@@ -225,7 +173,7 @@ class PandoraClient:
             params.update(extra_params)
 
         t = timeout if timeout is not None else self.timeout
-        logger.debug("Pandora API call: op2=%s params=%s", op2, params)
+        logger.debug("Pandora API: op2=%s (csv=%s)", op2, expect_csv)
 
         async with httpx.AsyncClient(timeout=t) as client:
             resp = await client.get(self.base_url, params=params)
@@ -233,304 +181,259 @@ class PandoraClient:
 
         text = resp.text.strip()
 
-        # Pandora returns plain-string "auth error" on bad credentials.
+        # Auth error check (plain string or wrapped JSON)
         if text.lower() in ('"auth error"', "'auth error'", "auth error"):
             raise PandoraAuthError(
-                "Pandora API returned 'auth error' — "
-                "check PANDORA_API_USER, PANDORA_API_USER_PASS, "
-                "and PANDORA_API_PASSWORD in your .env file."
+                "Pandora API returned 'auth error' — check credentials in .env"
             )
 
-        # Some operations return empty string when no data exists.
         if not text:
             return []
 
-        # ── Response parsing strategy ──────────────────────────────────
-        # Pandora v7.0 NG IGNORES return_type=json and always returns CSV
-        # (semicolon-delimited, header row + data rows).  Other versions
-        # return real JSON.  To handle both:
-        #   1. If text looks like CSV (contains ';' or matches test format),
-        #      parse as CSV FIRST.
-        #   2. Otherwise, try JSON.
-        #   3. If JSON succeeds but is suspect (plain string, list of
-        #      strings that look like error), re-parse as CSV or reject.
+        # ── Handle different response formats ──────────────────────────
 
-        looks_like_csv = (
-            ";" in text
-            or (op2 == "test" and "," in text and "\n" not in text)
-        )
+        # op2=test always returns CSV regardless of return_type
+        if op2 == "test":
+            return _parse_test_response(text)
 
-        if looks_like_csv:
-            # ── CSV path ───────────────────────────────────────────
-            if op2 == "test":
-                logger.info("Pandora returned CSV for test — parsing")
-                return _parse_test_response(text)
+        if expect_csv:
+            return _parse_pandora_csv(text)
 
-            logger.debug(
-                "Pandora op2=%s looks like CSV — parsing as semicolon CSV",
-                op2,
-            )
-            csv_data = _parse_pandora_csv(text, delimiter=";")
-            if csv_data:
-                return csv_data
-            # If semicolon failed, try comma
-            csv_data = _parse_pandora_csv(text, delimiter=",")
-            if csv_data:
-                return csv_data
-
-        # ── JSON path (fallback) ───────────────────────────────────────
+        # JSON path
         try:
             data = resp.json()
         except json.JSONDecodeError:
-            # Not JSON either — if CSV was attempted and failed, give up.
-            if looks_like_csv:
-                raise PandoraAPIError(
-                    f"Pandora returned CSV-like text but parse failed "
-                    f"for op2={op2}: {text[:500]}"
-                )
+            # Fallback: try CSV parse (some ops return CSV despite asking JSON)
+            logger.debug("op2=%s: JSON decode failed, trying CSV", op2)
+            csv_data = _parse_pandora_csv(text)
+            if csv_data:
+                return csv_data
             raise PandoraAPIError(
-                f"Pandora returned non-JSON for op2={op2}: {text[:500]}"
+                f"Pandora returned unrecognized format for op2={op2}: "
+                f"{text[:500]}"
             )
 
-        # Validate JSON response
-        if _is_error_response(data, op2):
-            raise PandoraAPIError(
-                f"Pandora rejected op2={op2}: {_format_error(data)}"
-            )
+        # Check for error responses disguised as JSON:
+        #   {"type":"string","data":"This operation does not exist."}
+        #   ["This operation does not exist."]
+        if isinstance(data, dict):
+            if data.get("type") == "string" and "data" in data:
+                msg = str(data["data"])
+                if any(kw in msg.lower() for kw in
+                       ("does not exist", "error", "invalid", "auth", "acl")):
+                    raise PandoraAPIError(
+                        f"Pandora rejected op2={op2}: {msg}"
+                    )
+            # Empty data from wrapped format
+            if data.get("data") == "" or data.get("data") == "No modules retrieved.":
+                return []
+            # Unwrap {"type":"array","data":[...]}
+            if data.get("type") == "array" and "data" in data:
+                return data["data"]
+
+        if isinstance(data, list) and len(data) > 0 and all(isinstance(x, str) for x in data):
+            combined = " ".join(data).lower()
+            if any(kw in combined for kw in
+                   ("does not exist", "error", "no modules")):
+                raise PandoraAPIError(
+                    f"Pandora rejected op2={op2}: {data}"
+                )
+
         return data
 
-    # ── Public API wrappers ────────────────────────────────────────────
+    # ── Public API ──────────────────────────────────────────────────────
 
     # -- 3.1  Connection test -------------------------------------------
 
     async def test(self) -> dict:
-        """Test connection to Pandora FMS and return server info.
-
-        Uses ``op2=test``. Does NOT require an ``id`` or ``other`` param.
-
-        Pandora v7.0 NG returns CSV ``OK,v7.0NG.720,PC180320`` (not JSON),
-        so this method always returns a properly parsed dict with keys
-        ``status``, ``version``, ``build``.
-        """
-        result = await self._call("test")
-        if isinstance(result, list):
-            return {"data": result}
-        if isinstance(result, dict) and "version" not in result:
-            # got some unexpected dict structure, wrap it
-            return {"data": result}
-        return result
+        """Test connection and return ``{status, version, build}``."""
+        return await self._call("test")
 
     # -- 3.2  Groups (tenants) ------------------------------------------
 
-    async def get_groups(self) -> list[dict]:
-        """Return all groups configured in Pandora.
-
-        Tries multiple op2 names because Pandora versions differ:
-          1. ``get_groups`` (newer versions)
-          2. ``module_groups`` (some v7.x)
-          3. **Fallback**: call ``all_agents`` without group filter and
-             extract unique groups from agent data.
-
-        Each group dict typically contains ``id_grupo`` / ``nombre``,
-        or after fallback normalization ``id`` / ``name`` / ``id_os``.
-        """
-        # Try known group-listing operations
-        for op2 in ("get_groups", "module_groups", "group", "groups", "get_group", "get_agent_groups"):
-            try:
-                result = await self._call(op2)
-            except PandoraAPIError as e:
-                logger.info("op2=%s not available: %s", op2, e)
-                continue
-
-            if isinstance(result, list):
-                return result
-            if isinstance(result, dict) and "data" in result:
-                return result["data"]
-
-        # Fallback: extract groups from all_agents response
-        logger.info(
-            "No direct group-listing op2 worked — "
-            "extracting groups from all_agents"
-        )
-        return await self._get_groups_from_agents()
-
-    async def _get_groups_from_agents(self) -> list[dict]:
-        """Extract unique groups by fetching all agents without a group
-        filter. This is a last-resort fallback used only when no
-        group-listing operation works.
-
-        For Pandora v7.0 NG that returns ``{"type":"array","data":[...]}``,
-        agent objects may contain ``id_grupo``.  If even that is missing,
-        we fall back to grouping agents by ``name`` (OS name) as a proxy.
-
-        Internal-only — normal code MUST use :meth:`get_agents_by_group`
-        with an explicit ``id_group``.
-
-        Does NOT pass ``other_mode`` — Pandora v7.0 NG returns valid JSON
-        when ``return_type=json`` is the only format directive.
-        """
-        try:
-            agents = await self._call("all_agents")
-        except PandoraAPIError:
-            logger.exception("all_agents without group filter failed")
-            return []
-
-        # Pandora v7.0 NG wraps JSON in {"type":"array","data":[...]}
-        if isinstance(agents, dict) and "data" in agents:
-            agents = agents["data"]
-
-        if not isinstance(agents, list):
-            logger.error(
-                "_get_groups_from_agents: expected list, got %s: %s",
-                type(agents).__name__,
-                str(agents)[:300],
-            )
-            return []
-
-        groups: dict[int | str, dict] = {}
-        for agent in agents:
-            if not isinstance(agent, dict):
-                continue
-            # Try group ID fields first
-            gid = (
-                agent.get("id_grupo")
-                or agent.get("id_group")
-                or agent.get("group")
-            )
-            if gid is not None:
-                try:
-                    gid = int(gid)
-                except (ValueError, TypeError):
-                    continue
-                if gid not in groups:
-                    groups[gid] = {
-                        "id": gid,
-                        "name": (
-                            agent.get("grupo")
-                            or agent.get("group_name")
-                            or agent.get("nombre_grupo")
-                            or f"Group {gid}"
-                        ),
-                    }
-                continue
-
-            # No group ID — group by OS/name as proxy (Pandora v7.0 NG
-            # uses 'name' = OS display name, e.g. "Linux", "Cisco").
-            # This is NOT ideal but is the best we can do when the API
-            # doesn't expose real groups.
-            proxy = agent.get("name", "").strip()
-            if proxy and proxy not in groups:
-                groups[proxy] = {"id": proxy, "name": proxy}
-
-        return sorted(
-            groups.values(),
-            key=lambda g: g["id"] if isinstance(g["id"], int) else str(g["id"]),
-        )
-
     async def get_module_groups(self) -> list[dict]:
-        """Return all module groups (alternative group listing).
+        """Return module groups from Pandora Community Edition.
 
-        Kept for backward compatibility — :meth:`get_groups` already
-        tries this op2 internally.
+        Returns CSV-parsed list with keys ``id``, ``name``.
+        Example: ``[{"id":"1","name":"General"}, ...]``
+
+        In Community Edition, this is the ONLY source of group listing.
         """
-        try:
-            result = await self._call("module_groups")
-        except PandoraAPIError:
-            return []
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
-        return []
+        rows = await self._call("module_groups", expect_csv=True)
+        # Normalize keys — CSV header is "id_agente_modulo;nombre" style
+        result: list[dict] = []
+        for row in rows:
+            # Keys vary by version; normalize to {"id", "name"}
+            gid = row.get(next((k for k in row if "id" in k.lower()), ""), "")
+            name = row.get(next((k for k in row if "nom" in k.lower() or "name" in k.lower()), ""), "")
+            if not name:
+                # Some versions have just "id;name" as headers
+                keys = list(row.keys())
+                gid = row.get(keys[0], "") if len(keys) > 0 else ""
+                name = row.get(keys[1], "") if len(keys) > 1 else ""
+            if name:
+                result.append({"id": gid, "name": name})
+        return result
 
-    # -- 3.3  Agents by group (tenant) ----------------------------------
+    async def get_groups_with_agents(self) -> list[dict]:
+        """Return groups enriched with a mapping to which agents belong.
 
-    async def get_agents_by_group(
-        self,
-        id_group: int,
-        *,
-        recursion: int = 0,
-        id_os: str = "",
-        module_state: str = "",
-        alias_filter: str = "",
-        policy_id: str = "",
-    ) -> list[dict]:
-        """Return all agents belonging to a specific group.
-
-        Uses ``op2=all_agents`` with server-side group filter.
-
-        ``other`` parameter format (pipe-separated, positions from docs):
-          1. id_os          — OS filter (empty = all)
-          2. id_group       — Group ID  ← **our primary filter**
-          3. module_state   — Module state filter (empty = all)
-          4. alias_filter   — Substring match on agent alias
-          5. policy_id      — Policy ID filter
-          6. csv_separator  — CSV field delimiter (irrelevant for JSON)
-          7. recursion      — 1 = include children of subgroups, 0 = exact
-
-        Args:
-            id_group: Pandora group ID (tenant).
-            recursion: 0 = only agents directly in this group;
-                       1 = include agents in child groups recursively.
-            id_os: Optional OS filter (e.g. ``"1"`` for Linux).
-            module_state: Filter by worst module state
-                          (``"critical"``, ``"warning"``, ``"unknown"``, ``"no_modules"``).
-            alias_filter: Substring to match against agent alias.
-            policy_id: Filter by policy ID.
+        Since Community Edition has no agent→group mapping, this method:
+          1. Loads all agents and all events.
+          2. Maps agents to groups based on which group their events appear in.
+          3. Returns groups with ``agent_ids`` list attached.
 
         Returns:
-            List of agent dicts. Each dict typically contains
-            ``id_agente``, ``alias``, ``nombre``, ``id_grupo``, etc.
+            List of dicts: ``{"id": str, "name": str, "agent_ids": [int, ...]}``
         """
-        # Build other:  id_os | id_group | module_state | alias | policy | separator | recursion
-        other = "|".join(
-            [
-                str(id_os),
-                str(id_group),
-                str(module_state),
-                str(alias_filter),
-                str(policy_id),
-                "",            # csv_separator — not needed for JSON
-                str(recursion),
-            ]
-        )
-        logger.info("Fetching agents for group id=%s", id_group)
-        result = await self._call(
-            "all_agents",
-            extra_params={
-                "other": other,
-                "other_mode": "url_encode_separator_|",
-            },
-        )
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
+        agents = await self.get_agents()
+        events = await self._call("events")
+        if not isinstance(events, list):
+            events = []
+
+        # Build agent→group mapping from events
+        agent_group: dict[int, set[int]] = defaultdict(set)
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            aid = evt.get("id_agente")
+            gid = evt.get("id_grupo")
+            if aid and gid:
+                try:
+                    agent_group[int(aid)].add(int(gid))
+                except (ValueError, TypeError):
+                    pass
+
+        # Build group registry from events
+        groups: dict[int, dict] = {}
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            gid = evt.get("id_grupo")
+            gname = evt.get("group_name")
+            if gid and gname:
+                try:
+                    gid_int = int(gid)
+                except (ValueError, TypeError):
+                    continue
+                if gid_int not in groups:
+                    groups[gid_int] = {
+                        "id": gid_int,
+                        "name": gname,
+                        "agent_ids": [],
+                    }
+
+        # Populate agent_ids
+        for aid, gids in agent_group.items():
+            for gid in gids:
+                if gid in groups:
+                    groups[gid]["agent_ids"].append(aid)
+        for g in groups.values():
+            g["agent_ids"] = sorted(set(g["agent_ids"]))
+            g["agent_count"] = len(g["agent_ids"])
+
+        return sorted(groups.values(), key=lambda g: str(g["name"]))
+
+    async def get_groups(self) -> list[dict]:
+        """Return all groups (tenants) for UI dropdown.
+
+        Tries in order:
+          1. Groups extracted from events (has agent mapping).
+          2. Module groups (fallback, no agent mapping).
+
+        Returns list of dicts with ``id`` and ``name`` keys.
+        """
+        # Primary: groups from events (best mapping)
+        try:
+            groups = await self.get_groups_with_agents()
+            if groups:
+                logger.info("Got %d groups from events", len(groups))
+                return groups
+        except PandoraAPIError:
+            logger.info("Could not get groups from events, trying module_groups")
+
+        # Fallback: module groups
+        try:
+            groups = await self.get_module_groups()
+            if groups:
+                logger.info("Got %d groups from module_groups", len(groups))
+                return groups
+        except PandoraAPIError:
+            logger.warning("module_groups also failed")
+
         return []
 
-    # -- 3.4  Agent modules ---------------------------------------------
+    # -- 3.3  Agents ----------------------------------------------------
 
-    async def get_agent_modules(self, agent_id: int) -> list[dict]:
-        """Return all modules belonging to a specific agent.
+    async def get_agents(self) -> list[dict]:
+        """Return ALL agents from Pandora.
 
-        Uses ``op2=get_agent_modules&id=<agent_id>``.
-        No ``other`` parameter is needed.
+        Community Edition has no server-side group filter for agents.
+        Use :meth:`get_agents_for_group` to filter by group client-side.
 
-        Each module dict typically contains ``id_agente_modulo``, ``nombre``,
-        ``descripcion``, ``id_tipo_modulo``, etc.
-
-        This is essential for discovering which module IDs to pass to
-        :meth:`get_module_data` for CPU, RAM, disk, Host Alive, etc.
+        Returns:
+            List of agent dicts with keys:
+            ``id_agente``, ``alias``, ``name`` (OS), ``direccion``,
+            ``comentarios``, ``nombre``, ``url_address``.
         """
-        logger.debug("Fetching modules for agent id=%s", agent_id)
-        result = await self._call("get_agent_modules", id_=str(agent_id))
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
+        agents = await self._call("all_agents")
+        if isinstance(agents, list):
+            return agents
+        if isinstance(agents, dict) and "data" in agents:
+            return agents["data"]
         return []
 
-    # -- 3.5  Module historical data ------------------------------------
+    async def get_agents_for_group(
+        self, id_group: int,
+    ) -> list[dict]:
+        """Return agents that belong to a specific group.
+
+        Since Community Edition has no server-side agent→group filter,
+        this method fetches all agents + all events, then filters
+        agents whose events appear in ``id_group``.
+
+        Args:
+            id_group: Group ID (from events' ``id_grupo``).
+
+        Returns:
+            List of agent dicts (same format as :meth:`get_agents`),
+            filtered to only those with events in this group.
+        """
+        agents = await self.get_agents()
+        events = await self._call("events")
+        if not isinstance(events, list):
+            events = []
+
+        # Find which agents have events in this group
+        agent_ids_in_group: set[int] = set()
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            try:
+                evt_group = int(evt.get("id_grupo") or 0)
+                evt_agent = int(evt.get("id_agente") or 0)
+            except (ValueError, TypeError):
+                continue
+            if evt_group == int(id_group) and evt_agent > 0:
+                agent_ids_in_group.add(evt_agent)
+
+        if not agent_ids_in_group:
+            logger.warning(
+                "No agents found for group %s (no events in this group)", id_group
+            )
+            return []
+
+        result = []
+        for agent in agents:
+            try:
+                aid = int(agent.get("id_agente") or 0)
+            except (ValueError, TypeError):
+                continue
+            if aid in agent_ids_in_group:
+                result.append(agent)
+        return result
+
+    # -- 3.4  Module data -----------------------------------------------
 
     async def get_module_data(
         self,
@@ -539,189 +442,182 @@ class PandoraClient:
         date_end: str,
         *,
         period: int = 0,
-        csv_separator: str = ";",
-        use_agent_alias: int = 0,
     ) -> list[dict]:
         """Return historical data points for a single module.
 
         Uses ``op2=module_data&id=<module_id>``.
 
-        ``other`` parameter format (pipe-separated, positions from docs):
-          1. csv_separator     — Field delimiter for CSV (default ``;``)
-          2. period            — Time period in seconds
-                                 (0 = use explicit date range below)
-          3. date_from         — ``YYYYMMDDThh:mm``
-          4. date_to           — ``YYYYMMDDThh:mm``
-          5. use_agent_alias   — 0 = use agent name, 1 = use alias
+        For Community Edition, ``other`` / ``other_mode`` params are NOT
+        compatible — they cause "Error in the parameters".  We rely on
+        ``return_type=json`` and filter client-side if needed.
 
         Args:
-            module_id: Pandora module ID.
-            date_start: Start date — ``"YYYY-MM-DD"`` or ``"YYYYMMDDThh:mm"``.
-            date_end: End date — same formats as date_start.
-            period: Period in seconds; if > 0, date_start/date_end are ignored
-                    by the API (set them to empty strings if using period).
-            csv_separator: Field delimiter (only matters for CSV; harmless for JSON).
-            use_agent_alias: 1 to label data with agent alias instead of name.
+            module_id: Module ID (from events' ``id_agentmodule``).
+            date_start: Start date ``"YYYY-MM-DD"``.
+            date_end: End date ``"YYYY-MM-DD"``.
+            period: Not used in Community Ed (ignored).
 
         Returns:
-            List of data-point dicts. Each typically contains
-            ``utimestamp``, ``datos`` (value), ``nombre``, etc.
-            Returns empty list if no data exists in the range.
+            List of data-point dicts. Each may contain ``utimestamp``,
+            ``datos`` (value), etc. Empty list if no data.
         """
-        date_from = _to_module_date(date_start)
-        date_to = _to_module_date(date_end)
-
-        other = "|".join(
-            [
-                csv_separator,
-                str(period),
-                date_from,
-                date_to,
-                str(use_agent_alias),
-            ]
-        )
-        logger.debug(
-            "Fetching module_data id=%s from %s to %s",
-            module_id, date_from, date_to,
-        )
-        result = await self._call(
-            "module_data",
-            extra_params={
-                "other": other,
-                "other_mode": "url_encode_separator_|",
-            },
-            id_=str(module_id),
-        )
+        # Try JSON first (no other/other_mode params)
+        result = await self._call("module_data", id_=str(module_id))
         if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
-        return []
+            data = result
+        elif isinstance(result, dict) and "data" in result:
+            data = result["data"]
+        else:
+            data = []
 
-    # -- 3.6  Events / alerts by group ----------------------------------
+        # Filter client-side by date range
+        if data and date_start and date_end:
+            ts_start = _to_unix(date_start, end_of_day=False)
+            ts_end = _to_unix(date_end, end_of_day=True)
+            filtered = []
+            for dp in data:
+                if not isinstance(dp, dict):
+                    continue
+                uts = dp.get("utimestamp")
+                if uts is not None:
+                    try:
+                        uts_int = int(uts)
+                    except (ValueError, TypeError):
+                        continue
+                    if ts_start <= uts_int <= ts_end:
+                        filtered.append(dp)
+            return filtered
 
-    async def get_events_by_group(
+        return data
+
+    # -- 3.5  Events / alerts -------------------------------------------
+
+    async def get_events(
         self,
-        id_group: int,
-        date_start: str,
-        date_end: str,
         *,
-        criticity: int = -1,
-        status: int = -1,
-        event_type: str = "",
-        tags: str = "",
-        agent_alias: str = "",
-        module_name: str = "",
-        event_substring: str = "",
-        limit: int = 500,
-        offset: int = 0,
-        optional_style: str = "",
+        id_group: int | None = None,
+        date_start: str | None = None,
+        date_end: str | None = None,
+        criticity: int | None = None,
+        event_type: str | None = None,
+        status: int | None = None,
+        limit: int = 0,
     ) -> list[dict]:
-        """Return events/alerts for a group in a date range.
+        """Return events from Pandora, optionally filtered.
 
-        Uses ``op2=events`` with server-side group + date filter.
-
-        ``other`` parameter format (pipe-separated, 16 positions):
-          1.  csv_separator        — Field delimiter (``;``)
-          2.  criticity            — Severity: -1=all, 0=info, 1=low, 2=medium, 3=warning, 4=critical
-          3.  agent_alias          — Filter by agent alias substring
-          4.  module_name          — Filter by module name substring
-          5.  alert_template_name  — Filter by alert template
-          6.  user                 — Filter by user
-          7.  min_interval         — Start Unix timestamp
-          8.  max_interval         — End Unix timestamp
-          9.  status               — Event status: -1=all, 0=new, 1=validated, 2=in progress
-          10. event_substring      — Text search within event description
-          11. limit                — Max records to return
-          12. offset               — Pagination offset
-          13. optional_style       — ``"total"`` for count only, ``"more_criticity"`` for max severity
-          14. td_grupo (id_group)  — **Group ID filter**
-          15. tags                 — Filter by tags
-          16. event_type           — ``"alert_fired"``, ``"alert_recovered"``,
-                                      ``"unknown"``, ``"not_normal"``, or empty for all
+        Community Edition does NOT support ``other`` / ``other_mode``
+        params for events — they cause "Error in the parameters".
+        All filtering is done client-side.
 
         Args:
-            id_group: Pandora group ID (tenant).
-            date_start: Start date (``"YYYY-MM-DD"`` or ``"YYYYMMDDThh:mm"``).
-            date_end: End date (same formats).
-            criticity: Severity filter (-1 = all).
-            status: Event status filter (-1 = all).
-            event_type: Type filter (empty = all).
-            tags: Tag filter (empty = all).
-            agent_alias: Agent alias substring filter.
-            module_name: Module name substring filter.
-            event_substring: Text search in event description.
-            limit: Max events to return.
-            offset: Pagination offset.
-            optional_style: ``"total"`` to get count instead of records.
+            id_group: Filter by group ID (events' ``id_grupo``).
+            date_start: Start date ``"YYYY-MM-DD"``.
+            date_end: End date ``"YYYY-MM-DD"``.
+            criticity: Severity filter (0=info, 1=low, 2=medium, 3=warning, 4=critical).
+            event_type: ``"alert_fired"``, ``"alert_recovered"``, etc.
+            status: Event status (0=new, 1=validated, 2=in progress).
+            limit: If > 0, return only first N events.
 
         Returns:
-            List of event dicts. Each typically contains
-            ``id_evento``, ``criticidad``, ``nombre``, ``utimestamp``, etc.
+            List of event dicts with keys: ``id_evento``, ``id_agente``,
+            ``agent_name``, ``id_grupo``, ``group_name``, ``criticity``,
+            ``criticity_name``, ``event_type``, ``timestamp``, ``utimestamp``,
+            ``evento`` (description), ``estado``, ``module_name``,
+            ``id_agentmodule``, etc.
         """
-        ts_start = _to_unix(date_start, end_of_day=False)
-        ts_end = _to_unix(date_end, end_of_day=True)
-
-        other = "|".join(
-            [
-                ";",                        # 1. csv_separator
-                str(criticity),             # 2. criticity
-                str(agent_alias),           # 3. agent alias
-                str(module_name),           # 4. module name
-                "",                         # 5. alert template name (unused)
-                "",                         # 6. user (unused)
-                str(ts_start),              # 7. min_interval (unix ts)
-                str(ts_end),                # 8. max_interval (unix ts)
-                str(status),                # 9. status
-                str(event_substring),       # 10. event substring
-                str(limit),                 # 11. register limit
-                str(offset),                # 12. offset
-                str(optional_style),        # 13. optional style
-                str(id_group),              # 14. td_grupo (GROUP FILTER)
-                str(tags),                  # 15. tags
-                str(event_type),            # 16. event type
-            ]
-        )
-        logger.info(
-            "Fetching events for group id=%s range %s..%s",
-            id_group, ts_start, ts_end,
-        )
-        result = await self._call(
-            "events",
-            extra_params={
-                "other": other,
-                "other_mode": "url_encode_separator_|",
-            },
-        )
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
-        return []
-
-    # -- 3.7  Convenience: get all agent modules for a group ------------
-
-    async def get_agents_with_modules(
-        self, id_group: int, *, recursion: int = 0
-    ) -> list[dict]:
-        """Return agents in a group, each enriched with its module list.
-
-        Convenience method that combines :meth:`get_agents_by_group` and
-        :meth:`get_agent_modules` into one call tree.
-
-        Args:
-            id_group: Pandora group ID.
-            recursion: Passed through to :meth:`get_agents_by_group`.
-
-        Returns:
-            List of agent dicts, each with an added ``"modules"`` key
-            containing the result of :meth:`get_agent_modules`.
-        """
-        agents = await self.get_agents_by_group(id_group, recursion=recursion)
-        for agent in agents:
-            agent_id = agent.get("id_agente")
-            if agent_id:
-                agent["modules"] = await self.get_agent_modules(int(agent_id))
+        # Pandora returns max ~40 events per call without pagination.
+        events = await self._call("events")
+        if not isinstance(events, list):
+            if isinstance(events, dict) and "data" in events:
+                events = events["data"]
             else:
-                agent["modules"] = []
-        return agents
+                events = []
+
+        # Client-side filters
+        ts_start = _to_unix(date_start, end_of_day=False) if date_start else None
+        ts_end = _to_unix(date_end, end_of_day=True) if date_end else None
+
+        filtered: list[dict] = []
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+
+            # Group filter
+            if id_group is not None:
+                try:
+                    evt_group = int(evt.get("id_grupo") or 0)
+                except (ValueError, TypeError):
+                    continue
+                if evt_group != int(id_group):
+                    continue
+
+            # Date filter
+            uts_str = evt.get("utimestamp")
+            if ts_start is not None or ts_end is not None:
+                if uts_str is None:
+                    continue
+                try:
+                    uts = int(uts_str)
+                except (ValueError, TypeError):
+                    continue
+                if ts_start is not None and uts < ts_start:
+                    continue
+                if ts_end is not None and uts > ts_end:
+                    continue
+
+            # Severity filter
+            if criticity is not None:
+                try:
+                    evt_crit = int(evt.get("criticity") or 0)
+                except (ValueError, TypeError):
+                    continue
+                if evt_crit != int(criticity):
+                    continue
+
+            # Event type filter
+            if event_type and evt.get("event_type") != event_type:
+                continue
+
+            # Status filter
+            if status is not None:
+                try:
+                    evt_status = int(evt.get("estado") or 0)
+                except (ValueError, TypeError):
+                    continue
+                if evt_status != int(status):
+                    continue
+
+            filtered.append(evt)
+
+        if limit and limit > 0:
+            return filtered[:limit]
+        return filtered
+
+    # -- 3.6  Convenience: agents with modules (via events) -------------
+
+    async def get_agent_module_ids(
+        self, agent_id: int,
+    ) -> list[int]:
+        """Return module IDs for an agent, extracted from events.
+
+        Since Community Edition has no ``agent_modules`` operation,
+        we discover module IDs by looking at which ``id_agentmodule``
+        values appear in events for this agent.
+
+        This is necessarily incomplete — only modules that fired events
+        will appear. For a complete module listing, a full scan of all
+        ``module_data`` IDs may be needed (slow).
+        """
+        events = await self.get_events()
+        module_ids: set[int] = set()
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            try:
+                evt_agent = int(evt.get("id_agente") or 0)
+                evt_module = int(evt.get("id_agentmodule") or 0)
+            except (ValueError, TypeError):
+                continue
+            if evt_agent == int(agent_id) and evt_module > 0:
+                module_ids.add(evt_module)
+        return sorted(module_ids)
