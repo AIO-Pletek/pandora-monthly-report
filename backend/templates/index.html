@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pandora Monthly Report</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f2f5;
+            color: #212529;
+            min-height: 100vh;
+        }
+        .header {
+            background: linear-gradient(135deg, #0d6efd 0%, #0a58ca 100%);
+            color: white;
+            padding: 1.5rem 2rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        .header h1 { font-size: 1.5rem; font-weight: 600; }
+        .header p { font-size: 0.85rem; opacity: 0.85; margin-top: 0.25rem; }
+        .container { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 2rem;
+            margin-bottom: 1.5rem;
+        }
+        .card h2 { font-size: 1.15rem; margin-bottom: 1.25rem; color: #343a40; }
+        .form-group { margin-bottom: 1.25rem; }
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #495057;
+            margin-bottom: 0.35rem;
+        }
+        .form-row { display: flex; gap: 1rem; }
+        .form-row .form-group { flex: 1; }
+        select, input {
+            width: 100%;
+            padding: 0.6rem 0.75rem;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            font-family: inherit;
+            transition: border-color 0.15s;
+        }
+        select:focus, input:focus {
+            outline: none;
+            border-color: #0d6efd;
+            box-shadow: 0 0 0 3px rgba(13,110,253,0.15);
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.65rem 1.5rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .btn-primary {
+            background: #0d6efd;
+            color: white;
+        }
+        .btn-primary:hover { background: #0b5ed7; }
+        .btn-primary:disabled { background: #6c757d; cursor: not-allowed; }
+        .btn-download {
+            background: #198754;
+            color: white;
+            text-decoration: none;
+        }
+        .btn-download:hover { background: #157347; }
+
+        /* Status alert */
+        .alert {
+            padding: 0.9rem 1rem;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            margin-top: 1rem;
+            display: none;
+        }
+        .alert-success { background: #d1e7dd; color: #0f5132; border: 1px solid #badbcc; }
+        .alert-error { background: #f8d7da; color: #842029; border: 1px solid #f5c2c7; }
+        .alert-info { background: #cff4fc; color: #055160; border: 1px solid #b6effb; }
+
+        /* Spinner */
+        .spinner {
+            display: inline-block;
+            width: 1rem; height: 1rem;
+            border: 2px solid rgba(255,255,255,0.4);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .footer {
+            text-align: center;
+            padding: 1.5rem;
+            color: #6c757d;
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 Pandora Monthly Report</h1>
+        <p>Generate infrastructure monthly reports from Pandora FMS</p>
+    </div>
+
+    <div class="container">
+        <div class="card">
+            <h2>Generate Report</h2>
+
+            <form id="reportForm">
+                <div class="form-group">
+                    <label for="group">Tenant / Group</label>
+                    <select id="group" required>
+                        <option value="">Loading groups...</option>
+                    </select>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="month">Month</label>
+                        <select id="month" required>
+                            {% for m in range(1, 13) %}
+                            <option value="{{ m }}" {% if m == current_month %}selected{% endif %}>
+                                {{ '%02d' % m }} — {{ ['January','February','March','April','May','June',
+                                'July','August','September','October','November','December'][m-1] }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="year">Year</label>
+                        <select id="year" required>
+                            {% for y in range(current_year - 2, current_year + 1) %}
+                            <option value="{{ y }}" {% if y == current_year %}selected{% endif %}>{{ y }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary" id="generateBtn">
+                    ⚡ Generate Report
+                </button>
+            </form>
+
+            <div id="status" class="alert"></div>
+        </div>
+
+        <div id="resultCard" class="card" style="display:none;">
+            <h2>✅ Report Ready</h2>
+            <p id="resultInfo" style="margin-bottom:1rem; color:#6c757d; font-size:0.9rem;"></p>
+            <a id="downloadLink" href="#" class="btn btn-download">📥 Download Report (.docx)</a>
+        </div>
+    </div>
+
+    <div class="footer">
+        Pandora Monthly Report — Internal Tool &copy; {{ current_year }}
+    </div>
+
+    <script>
+        const form = document.getElementById('reportForm');
+        const groupSelect = document.getElementById('group');
+        const generateBtn = document.getElementById('generateBtn');
+        const statusDiv = document.getElementById('status');
+        const resultCard = document.getElementById('resultCard');
+        const resultInfo = document.getElementById('resultInfo');
+        const downloadLink = document.getElementById('downloadLink');
+
+        // Load groups on page load
+        async function loadGroups() {
+            try {
+                const resp = await fetch('/api/groups');
+                const data = await resp.json();
+                groupSelect.innerHTML = '';
+                if (data.groups && data.groups.length > 0) {
+                    for (const g of data.groups) {
+                        const opt = document.createElement('option');
+                        opt.value = g.id;
+                        opt.textContent = `${g.name} (${g.agent_count} agents)`;
+                        groupSelect.appendChild(opt);
+                    }
+                } else {
+                    groupSelect.innerHTML = '<option value="">No groups found</option>';
+                }
+            } catch (e) {
+                groupSelect.innerHTML = '<option value="">Failed to load groups</option>';
+                showStatus('Failed to load group list. Is the API running?', 'error');
+            }
+        }
+        loadGroups();
+
+        function showStatus(msg, type) {
+            statusDiv.textContent = msg;
+            statusDiv.className = 'alert alert-' + type;
+            statusDiv.style.display = 'block';
+        }
+
+        function hideStatus() {
+            statusDiv.style.display = 'none';
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const groupId = groupSelect.value;
+            const groupName = groupSelect.options[groupSelect.selectedIndex]?.text || '';
+            const month = document.getElementById('month').value;
+            const year = document.getElementById('year').value;
+
+            if (!groupId) {
+                showStatus('Please select a tenant/group.', 'error');
+                return;
+            }
+
+            generateBtn.disabled = true;
+            generateBtn.innerHTML = '<span class="spinner"></span> Generating...';
+            hideStatus();
+            resultCard.style.display = 'none';
+
+            try {
+                const resp = await fetch('/api/report/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id_group: parseInt(groupId),
+                        group_name: groupName.split(' (')[0],
+                        year: parseInt(year),
+                        month: parseInt(month),
+                    }),
+                });
+
+                const data = await resp.json();
+
+                if (resp.ok && data.status === 'completed') {
+                    showStatus('Report generated successfully!', 'success');
+                    resultInfo.textContent =
+                        `Tenant: ${data.tenant_name} | Period: ${data.period} | ` +
+                        `Agents: ${data.total_agents} | Events: ${data.total_events}`;
+                    downloadLink.href = data.download_url;
+                    resultCard.style.display = 'block';
+                    resultCard.scrollIntoView({ behavior: 'smooth' });
+                } else {
+                    showStatus(data.detail || 'Generation failed.', 'error');
+                }
+            } catch (err) {
+                showStatus('Request failed: ' + err.message, 'error');
+            } finally {
+                generateBtn.disabled = false;
+                generateBtn.innerHTML = '⚡ Generate Report';
+            }
+        });
+    </script>
+</body>
+</html>
