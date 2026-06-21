@@ -15,16 +15,13 @@ Run:
 
 from __future__ import annotations
 
-import asyncio
 import calendar
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 from config import (
     APP_ENV,
@@ -54,10 +51,16 @@ app = FastAPI(
 )
 
 # ── Jinja2 setup ───────────────────────────────────────────────────────────
-from fastapi.templating import Jinja2Templates  # noqa: E402
+from jinja2 import Environment, FileSystemLoader  # noqa: E402
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+_jinja_env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)))
+
+
+def _render_template(name: str, **ctx) -> HTMLResponse:
+    """Render a Jinja2 template to HTMLResponse (avoids starlette compat issues)."""
+    template = _jinja_env.get_template(name)
+    return HTMLResponse(template.render(**ctx))
 
 
 # ── Client factory ─────────────────────────────────────────────────────────
@@ -75,14 +78,21 @@ def _get_client() -> PandoraClient:
 # ── Routes: UI ─────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def index():
     """Main page — group selection + month picker form."""
     now = datetime.now()
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "current_year": now.year,
-        "current_month": now.month,
-    })
+    months = [
+        (1, "January"), (2, "February"), (3, "March"), (4, "April"),
+        (5, "May"), (6, "June"), (7, "July"), (8, "August"),
+        (9, "September"), (10, "October"), (11, "November"), (12, "December"),
+    ]
+    years = list(range(now.year - 2, now.year + 1))
+    return _render_template("index.html",
+        current_year=now.year,
+        current_month=now.month,
+        months=months,
+        years=years,
+    )
 
 
 # ── Routes: API ────────────────────────────────────────────────────────────
