@@ -209,11 +209,16 @@ class ReportBuilder:
         tenant_name: str,
         period: str,
         output_dir: Path,
+        date_start: str = "",
+        date_end: str = "",
     ) -> None:
         self.tenant_name = tenant_name
         self.period = period
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Date range filter (YYYY-MM-DD)
+        self._ts_start = _to_ts(date_start, end_of_day=False) if date_start else None
+        self._ts_end = _to_ts(date_end, end_of_day=True) if date_end else None
 
         self.doc = Document()
         self._chart_paths: list[str] = []
@@ -330,6 +335,12 @@ class ReportBuilder:
             if not data_points:
                 continue
 
+            # Filter to selected month only
+            if self._ts_start is not None and self._ts_end is not None:
+                data_points = _filter_by_month(data_points, self._ts_start, self._ts_end)
+            if not data_points:
+                continue
+
             label, color = _classify_smart(data_points, pos)
 
             # Avoid duplicate labels by appending module ID suffix
@@ -407,6 +418,8 @@ def build_report(
     agents: list[dict],
     agent_modules_map: dict[int, list[dict]],
     output_dir: str | Path,
+    date_start: str = "",
+    date_end: str = "",
 ) -> str:
     """Generate the Resources Usage Metric Report.
 
@@ -416,6 +429,8 @@ def build_report(
         agents: List of agent dicts.
         agent_modules_map: ``{agent_id: [module_dict, ...]}`` per agent.
         output_dir: Where to save the .docx.
+        date_start: Start date "YYYY-MM-DD" (filters chart data).
+        date_end: End date "YYYY-MM-DD" (filters chart data).
 
     Returns:
         Absolute path to the generated file.
@@ -428,6 +443,8 @@ def build_report(
             tenant_name=tenant_name,
             period=period,
             output_dir=out,
+            date_start=date_start,
+            date_end=date_end,
         )
         for agent in agents:
             aid_raw = agent.get("id_agente")
@@ -446,3 +463,23 @@ def _safe_filename(name: str) -> str:
     name = name.strip().replace(" ", "_")
     name = re.sub(r"[^\w\-_.\[\]]", "", name)
     return name or "report"
+
+
+def _to_ts(date_str: str, end_of_day: bool = False) -> int:
+    """Convert YYYY-MM-DD to Unix timestamp."""
+    dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return int(dt.timestamp())
+
+
+def _filter_by_month(
+    data_points: list[dict[str, Any]],
+    ts_start: int,
+    ts_end: int,
+) -> list[dict[str, Any]]:
+    """Filter data points to only those within the date range."""
+    return [
+        p for p in data_points
+        if ts_start <= p.get("utimestamp", 0) <= ts_end
+    ]

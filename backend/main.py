@@ -205,11 +205,15 @@ async def generate_report(req: ReportRequest):
             len(agents), total_modules, group_name, period,
         )
 
-        # 3. Build the .docx report
+        # 3. Build the .docx report (filter data to selected month)
+        date_start = f"{year:04d}-{month:02d}-01"
+        date_end = f"{year:04d}-{month:02d}-{last_day:02d}"
         from report_builder import build_report as build_usage_report
         output_path = build_usage_report(
             tenant_name=group_name,
             period=period,
+            date_start=date_start,
+            date_end=date_end,
             agents=agents,
             agent_modules_map=agent_modules_map,
             output_dir=OUTPUT_DIR,
