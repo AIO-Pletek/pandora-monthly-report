@@ -335,7 +335,7 @@ class PandoraClient:
         or after fallback normalization ``id`` / ``name`` / ``id_os``.
         """
         # Try known group-listing operations
-        for op2 in ("get_groups", "module_groups"):
+        for op2 in ("get_groups", "module_groups", "group", "groups", "get_group", "get_agent_groups"):
             try:
                 result = await self._call(op2)
             except PandoraAPIError as e:
@@ -359,59 +359,73 @@ class PandoraClient:
         filter. This is a last-resort fallback used only when no
         group-listing operation works.
 
+        For Pandora v7.0 NG that returns ``{"type":"array","data":[...]}``,
+        agent objects may contain ``id_grupo``.  If even that is missing,
+        we fall back to grouping agents by ``name`` (OS name) as a proxy.
+
         Internal-only — normal code MUST use :meth:`get_agents_by_group`
         with an explicit ``id_group``.
 
-        Always passes ``other_mode=url_encode_separator_|`` to force CSV
-        output (Pandora v7.0 NG ignores ``return_type=json``). The empty
-        ``other`` string returns all agents across all groups.
+        Does NOT pass ``other_mode`` — Pandora v7.0 NG returns valid JSON
+        when ``return_type=json`` is the only format directive.
         """
         try:
-            agents = await self._call(
-                "all_agents",
-                extra_params={
-                    "other": "||||||0",
-                    "other_mode": "url_encode_separator_|",
-                },
-            )
+            agents = await self._call("all_agents")
         except PandoraAPIError:
-            logger.exception("all_agents without filter also failed")
+            logger.exception("all_agents without group filter failed")
             return []
 
-        # Safety: if _call somehow returned non-list, bail out.
+        # Pandora v7.0 NG wraps JSON in {"type":"array","data":[...]}
+        if isinstance(agents, dict) and "data" in agents:
+            agents = agents["data"]
+
         if not isinstance(agents, list):
             logger.error(
-                "_get_groups_from_agents: expected list, got %s",
+                "_get_groups_from_agents: expected list, got %s: %s",
                 type(agents).__name__,
+                str(agents)[:300],
             )
             return []
 
-        groups: dict[int, dict] = {}
+        groups: dict[int | str, dict] = {}
         for agent in agents:
             if not isinstance(agent, dict):
                 continue
+            # Try group ID fields first
             gid = (
                 agent.get("id_grupo")
                 or agent.get("id_group")
                 or agent.get("group")
             )
-            if gid is None:
+            if gid is not None:
+                try:
+                    gid = int(gid)
+                except (ValueError, TypeError):
+                    continue
+                if gid not in groups:
+                    groups[gid] = {
+                        "id": gid,
+                        "name": (
+                            agent.get("grupo")
+                            or agent.get("group_name")
+                            or agent.get("nombre_grupo")
+                            or f"Group {gid}"
+                        ),
+                    }
                 continue
-            try:
-                gid = int(gid)
-            except (ValueError, TypeError):
-                continue
-            if gid not in groups:
-                groups[gid] = {
-                    "id": gid,
-                    "name": (
-                        agent.get("grupo")
-                        or agent.get("group_name")
-                        or agent.get("nombre_grupo")
-                        or f"Group {gid}"
-                    ),
-                }
-        return sorted(groups.values(), key=lambda g: g["id"])
+
+            # No group ID — group by OS/name as proxy (Pandora v7.0 NG
+            # uses 'name' = OS display name, e.g. "Linux", "Cisco").
+            # This is NOT ideal but is the best we can do when the API
+            # doesn't expose real groups.
+            proxy = agent.get("name", "").strip()
+            if proxy and proxy not in groups:
+                groups[proxy] = {"id": proxy, "name": proxy}
+
+        return sorted(
+            groups.values(),
+            key=lambda g: g["id"] if isinstance(g["id"], int) else str(g["id"]),
+        )
 
     async def get_module_groups(self) -> list[dict]:
         """Return all module groups (alternative group listing).
