@@ -1,0 +1,33 @@
+# Environment variables — contains credentials
+.env
+
+# Generated reports — temporary files
+backend/output/
+!backend/output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store

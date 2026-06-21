@@ -1,0 +1,28 @@
+[Unit]
+Description=Pandora Monthly Report — FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/pandora-monthly-report/backend
+EnvironmentFile=/opt/pandora-monthly-report/.env
+ExecStart=/opt/pandora-monthly-report/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+
+# Security hardening (opsional)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/pandora-monthly-report/backend/output /var/log/pandora-report
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pandora-report
+
+[Install]
+WantedBy=multi-user.target
