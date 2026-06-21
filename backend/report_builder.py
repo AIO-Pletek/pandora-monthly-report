@@ -42,78 +42,56 @@ CHART_H_INCHES = 2.2
 COLOR_CPU = "#0D6EFD"
 COLOR_MEM = "#198754"
 COLOR_DISK = "#DC3545"
-COLOR_EXTRA = "#6C757D"
-EXTRA_COLORS = ["#FD7E14", "#6F42C1", "#20C997", "#0DCAF0", "#FFC107"]
 
 FONT_FAMILY = "DejaVu Sans"
 
-# Position-based metric display names (modules sorted by ID ascending).
-_POSITION_LABELS = [
-    "CPU Utilization",
-    "Memory Usage",
-    "Disk C:/",
-    "Disk D:/",
-    "Disk E:/",
-    "Disk F:/",
-    "Metric 7",
-    "Metric 8",
-]
-
-_POSITION_COLORS = [
-    COLOR_CPU,   # CPU
-    COLOR_MEM,   # Memory
-    COLOR_DISK,  # Disk C
-    COLOR_DISK,  # Disk D
-    COLOR_DISK,  # Disk E
-    *EXTRA_COLORS,
-]
+# Metric categories we care about. Everything else is skipped.
+_CPU_LABEL = "CPU Utilization"
+_MEM_LABEL = "Memory Usage"
+_DISK_LABELS = ["Disk C:/", "Disk D:/", "Disk E:/"]
+_MAX_DISK = 3
 
 
-def _label_for_position(pos: int) -> tuple[str, str]:
-    """Return (display_name, color) for a module at the given position."""
-    if pos < len(_POSITION_LABELS):
-        label = _POSITION_LABELS[pos]
-    else:
-        label = f"Metric {pos + 1}"
-    color = _POSITION_COLORS[pos] if pos < len(_POSITION_COLORS) else COLOR_EXTRA
-    return label, color
-
-
-def _classify_smart(
+def _classify_metric(
     data_points: list[dict[str, Any]],
-    position: int,
-) -> tuple[str, str]:
-    """Classify a module using position + value-range heuristic.
+) -> tuple[str, str, str]:
+    """Classify a module by value-range heuristics.
 
-    - Position 0 → CPU always
-    - Position 1 → Memory always
-    - Position 2+ → Disk C:/, D:/, E:/, etc.
-    - If value range doesn't match position (e.g., pos=0 but max=5000),
-      adjust the label suffix but not the category.
+    Returns ``(category, display_name, color)`` where category is one of
+    ``"cpu"``, ``"memory"``, ``"disk"``, or ``"skip"``.
+
+    Heuristics (Pandora Community Ed has NO module names):
+      - CPU: values all ≤110  →  "CPU Utilization"
+      - Memory: median > 1000 OR value range suggests bytes/KB  →  "Memory Usage"
+      - Disk: values ≤110 (percentage) or mid-range  →  "Disk _:/"
+      - Skip: very large values (>10M, network bytes), or unable to classify
     """
-    label, color = _label_for_position(position)
-
     if not data_points:
-        return label, color
+        return ("cpu", _CPU_LABEL, COLOR_CPU)
 
-    vals = [p["value"] for p in data_points if p.get("value") is not None]
+    vals = sorted([p["value"] for p in data_points if p.get("value") is not None])
     if not vals:
-        return label, color
+        return ("cpu", _CPU_LABEL, COLOR_CPU)
 
-    max_val = max(vals)
+    max_val = vals[-1]
+    median = vals[len(vals) // 2]
+    avg = sum(vals) / len(vals)
 
-    # Position 0 (CPU): values should be 0-100%
-    if position == 0 and max_val > 100:
-        # Higher than CPU range — could be something else, keep label
-        pass
+    # CPU: all values ≤ 110 (percentage, some modules spike slightly above 100)
+    if max_val <= 110:
+        return ("cpu", _CPU_LABEL, COLOR_CPU)
 
-    # Position 1 (Memory): values typically >100, add unit hint
-    if position == 1:
-        if max_val < 100:
-            # Low values — might actually be another CPU-like metric
-            pass
+    # Memory: typically large numbers (KB/MB/bytes) or very wide range
+    if max_val > 100000 or median > 1000 or (max_val > 500 and avg > 500):
+        return ("memory", _MEM_LABEL, COLOR_MEM)
 
-    return label, color
+    # Disk: medium numbers (bytes/percentage/IOPS) or percentages ≤ 110
+    return ("disk", "", COLOR_DISK)  # label assigned later
+
+
+def _should_show(category: str) -> bool:
+    """Only CPU, Memory, and Disk metrics pass."""
+    return category in ("cpu", "memory", "disk")
 
 
 # ── Chart generation ──────────────────────────────────────────────────────
@@ -323,24 +301,53 @@ class ReportBuilder:
         modules_sorted = sorted(modules, key=lambda m: m.get("module_id", 0))
 
         if not modules_sorted:
-            for label in ["CPU Utilization", "Memory Usage", "Disk C:/", "Disk D:/"]:
-                self._add_no_data_row(label)
+            self._add_no_data_row("CPU Utilization")
+            self._add_no_data_row("Memory Usage")
+            self._add_no_data_row("Disk C:/")
+            self._add_no_data_row("Disk D:/")
             return
 
-        # Track which labels we've used to avoid duplicates
-        used_positions: set[str] = set()
+        # Classify each module → keep only CPU, Memory, Disk
+        cpu_mods: list[dict] = []
+        mem_mods: list[dict] = []
+        disk_mods: list[dict] = []
 
-        for pos, mod in enumerate(modules_sorted):
+        for mod in modules_sorted:
+            pts = mod.get("data_points", [])
+            cat, _, _ = _classify_metric(pts)
+            if cat == "cpu":
+                cpu_mods.append(mod)
+            elif cat == "memory":
+                mem_mods.append(mod)
+            elif cat == "disk":
+                disk_mods.append(mod)
+            # else: skip (network, swap, unknown metrics)
+
+        # Build ordered display list: CPU → Memory → Disk C, D, E
+        to_display: list[tuple[str, str, dict]] = []  # (label, color, mod)
+
+        if cpu_mods:
+            to_display.append((_CPU_LABEL, COLOR_CPU, cpu_mods[0]))
+        else:
+            to_display.append((_CPU_LABEL, COLOR_CPU, {}))
+
+        if mem_mods:
+            to_display.append((_MEM_LABEL, COLOR_MEM, mem_mods[0]))
+        else:
+            to_display.append((_MEM_LABEL, COLOR_MEM, {}))
+
+        for i, dmod in enumerate(disk_mods):
+            if i >= _MAX_DISK:
+                break
+            to_display.append((_DISK_LABELS[i], COLOR_DISK, dmod))
+
+        # If no disk modules, show at least C: and D: as "No data"
+        if len(disk_mods) < 2:
+            for i in range(len(disk_mods), 2):
+                to_display.append((_DISK_LABELS[i], COLOR_DISK, {}))
+
+        for label, color, mod in to_display:
             all_points = mod.get("data_points", [])
-            label, color = _classify_smart(all_points, pos)
-
-            # Deduplicate labels
-            base_label = label
-            suffix = 2
-            while label in used_positions:
-                label = f"{base_label} ({suffix})"
-                suffix += 1
-            used_positions.add(label)
 
             # Filter to selected month
             in_month = []
@@ -369,12 +376,12 @@ class ReportBuilder:
                 else:
                     self._add_empty_cell(row.cells[1], "Chart render failed")
             elif in_month and len(in_month) == 1:
-                # Only 1 data point — show value directly
                 p = in_month[0]
                 val_str = f"{p['value']:.2f}"
                 ts_str = p['timestamp'].strftime("%d %b %Y %H:%M")
-                cell_text = f"Single data point: {val_str}  ({ts_str})"
-                self._add_empty_cell(row.cells[1], cell_text)
+                self._add_empty_cell(row.cells[1], f"Single point: {val_str}  ({ts_str})")
+            elif not mod:
+                self._add_empty_cell(row.cells[1], "No data for this period")
             else:
                 self._add_empty_cell(row.cells[1], "No data for this period")
 
