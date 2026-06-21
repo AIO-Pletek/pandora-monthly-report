@@ -1,509 +1,378 @@
 """
-Monthly report generator — builds .docx with embedded charts.
+Monthly report builder — generates .docx matching reference format.
 
-Uses ``python-docx`` for document generation and ``matplotlib`` (Agg backend)
-for charts rendered to PNG, then embedded into the document.
+Reference format (extracted from user-provided .docx):
+  - Title: "Resources Usage Metric Report" (Arial 24pt bold)
+  - Subtitle: "Report Period: <Month Year>" (Arial 14pt)
+  - Table (2 cols): "Item" | "Usage Metric"
+    - Per VM: "Virtual Machine" | agent alias (bold)
+    - Per metric: metric display name | line chart PNG showing values
 
-**Community Edition note:**
-  Metric data (CPU/RAM/Disk) may not be available because Pandora Community
-  Edition has no ``get_agent_modules`` operation.  The report gracefully
-  shows "N/A" for unavailable metrics and focuses on event/alert data which
-  IS available.
+Uses ``python-docx`` for document and ``matplotlib`` (Agg backend)
+for line charts rendered to PNG, embedded into table cells.
 """
 
 from __future__ import annotations
 
+import calendar
+import io
 import logging
 import os
+import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-# ── matplotlib MUST use Agg backend (server-side, no display) ──────
+# ── matplotlib MUST use Agg backend first ──────────────────────────
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import matplotlib.ticker as mticker  # noqa: E402
+import matplotlib.pyplot as plt            # noqa: E402
+import matplotlib.dates as mdates          # noqa: E402
+import matplotlib.ticker as mticker        # noqa: E402
 
-from docx import Document  # noqa: E402
-from docx.enum.section import WD_ORIENT  # noqa: E402
+from docx import Document                  # noqa: E402
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # noqa: E402
-from docx.shared import Inches, Pt, RGBColor  # noqa: E402
+from docx.shared import Inches, Pt, RGBColor, Emu  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# ── Chart style constants ──────────────────────────────────────────────────
-COLORS = {
-    "critical": "#DC3545",
-    "warning": "#FFC107",
-    "info": "#17A2B8",
-    "unknown": "#6C757D",
-    "primary": "#0D6EFD",
-    "accent": "#198754",
-}
-CHART_DPI = 150
-CHART_WIDTH = 8
-CHART_HEIGHT = 5
+# ── Constants ──────────────────────────────────────────────────────────────
+CHART_DPI = 130
+CHART_W_INCHES = 5.5
+CHART_H_INCHES = 2.2
+
+COLOR_CPU = "#0D6EFD"
+COLOR_MEM = "#198754"
+COLOR_DISK = "#DC3545"
+COLOR_DEFAULT = "#6C757D"
+
+FONT_FAMILY = "DejaVu Sans"
+
+# Metric name pattern → display name + chart color
+_METRIC_PATTERNS: list[tuple[str, str, str]] = [
+    # (regex, display_name, color)
+    (r"(?i)cpu|processor|utilization|load|usage.*cpu", "CPU Utilization", COLOR_CPU),
+    (r"(?i)mem|ram|memory", "Memory Usage", COLOR_MEM),
+    (r"(?i)disk.*[c][:/]|storage.*[c][:/]|diskused.*[c]", "Disk C:/", COLOR_DISK),
+    (r"(?i)disk.*[d][:/]|storage.*[d][:/]|diskused.*[d]", "Disk D:/", COLOR_DISK),
+    (r"(?i)disk.*[e][:/]|diskused.*[e]", "Disk E:/", COLOR_DISK),
+    (r"(?i)disk|storage|diskused_", "Disk", COLOR_DISK),
+]
 
 
-def _setup_plot_style() -> None:
-    """Apply consistent style to all matplotlib charts."""
+def _classify_metric(data_parts: list[str]) -> tuple[str, str]:
+    """Guess metric type from value patterns.
+
+    Pandora Community Ed gives us no module name — only values.
+    We classify by value characteristics:
+      - CPU: typically 0–100 (percentage)
+      - Memory/Disk: large numbers (KB/bytes/counts)
+
+    Returns (display_name, color).
+    """
+    if not data_parts:
+        return ("Metric", COLOR_DEFAULT)
+
+    # Extract values (every other item: ts, value, ts, value, ...)
+    vals = []
+    for i, part in enumerate(data_parts):
+        if i % 2 == 1:  # odd positions are values
+            try:
+                vals.append(float(part))
+            except ValueError:
+                pass
+
+    if not vals:
+        return ("Metric", COLOR_DEFAULT)
+
+    avg = sum(vals) / len(vals)
+    max_val = max(vals)
+
+    # All values 0–100 → likely CPU %
+    if max_val <= 100:
+        return ("CPU Utilization", COLOR_CPU)
+
+    # Values in typical memory range (GB → large numbers)
+    if avg > 1000:
+        return ("Memory Usage", COLOR_MEM)
+
+    # Mid-range → likely disk
+    return ("Disk", COLOR_DISK)
+
+
+# ── Chart generation ──────────────────────────────────────────────────────
+
+def _setup_style() -> None:
     plt.rcParams.update({
         "font.family": "sans-serif",
-        "font.sans-serif": ["DejaVu Sans", "Liberation Sans", "Arial"],
-        "font.size": 10,
-        "axes.titlesize": 13,
-        "axes.labelsize": 11,
+        "font.sans-serif": [FONT_FAMILY, "Liberation Sans", "Arial"],
+        "font.size": 8,
+        "axes.titlesize": 10,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
         "figure.facecolor": "white",
-        "axes.facecolor": "#F8F9FA",
+        "axes.facecolor": "#FAFBFC",
         "axes.edgecolor": "#DEE2E6",
         "axes.grid": True,
-        "grid.alpha": 0.4,
+        "grid.alpha": 0.35,
         "grid.color": "#CED4DA",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
     })
 
 
-_setup_plot_style()
+_setup_style()
 
 
-# ── Chart generators ───────────────────────────────────────────────────────
-
-def generate_severity_pie(
-    severity_counts: dict[str, int],
+def generate_metric_chart(
+    data_parts: list[str],
+    label: str,
+    color: str,
     output_path: str | Path,
-) -> str:
-    """Generate a donut chart for event severity breakdown.
+) -> str | None:
+    """Generate a line chart for one metric module.
 
-    Args:
-        severity_counts: e.g. ``{"Critical": 3, "Warning": 5, "Info": 1}``
-        output_path: Where to save the PNG.
+    ``data_parts`` is a list of alternating ``utimestamp`` and ``value``
+    strings from Pandora's raw module_data response.
 
-    Returns:
-        Absolute path to the saved PNG.
+    Returns the absolute path to the saved PNG, or None if no valid data.
     """
-    labels = list(severity_counts.keys())
-    values = list(severity_counts.values())
-    pie_colors = [
-        COLORS.get(lbl.lower(), COLORS["unknown"]) for lbl in labels
-    ]
+    if not data_parts or len(data_parts) < 2:
+        return None
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    wedges, texts, autotexts = ax.pie(
-        values,
-        labels=None,
-        autopct="%1.1f%%" if sum(values) > 0 else None,
-        startangle=90,
-        colors=pie_colors,
-        wedgeprops={"width": 0.4, "edgecolor": "white", "linewidth": 1},
-        pctdistance=0.78,
-    )
-    for at in autotexts:
-        at.set_fontsize(9)
-        at.set_fontweight("bold")
+    # Parse: even indices = timestamps, odd indices = values
+    timestamps: list[datetime] = []
+    values: list[float] = []
 
-    # Legend
-    legend_labels = [
-        f"{lbl}  ({val})" for lbl, val in zip(labels, values)
-    ]
-    ax.legend(wedges, legend_labels, title="Severity", loc="center left",
-              bbox_to_anchor=(1, 0.5), fontsize=9)
+    for i in range(0, len(data_parts) - 1, 2):
+        try:
+            ts = datetime.fromtimestamp(int(data_parts[i]))
+            val = float(data_parts[i + 1])
+            timestamps.append(ts)
+            values.append(val)
+        except (ValueError, OSError):
+            continue
 
-    ax.set_title("Event Severity Distribution", fontweight="bold", pad=15)
-    fig.tight_layout()
-    fig.savefig(str(output_path), dpi=CHART_DPI, bbox_inches="tight")
-    plt.close(fig)
-    return str(Path(output_path).resolve())
+    if not timestamps:
+        return None
 
+    fig, ax = plt.subplots(figsize=(CHART_W_INCHES, CHART_H_INCHES))
 
-def generate_events_timeline(
-    events: list[dict],
-    output_path: str | Path,
-) -> str:
-    """Generate a bar chart of events per day.
+    ax.plot(timestamps, values, color=color, linewidth=1.2, marker=None)
+    ax.fill_between(timestamps, values, alpha=0.08, color=color)
 
-    Args:
-        events: List of event dicts, each must have a ``utimestamp`` field.
-        output_path: Where to save the PNG.
+    # Formatting
+    ax.set_ylabel(label, color=color, fontweight="bold")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=7))
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=4))
 
-    Returns:
-        Absolute path to the saved PNG.
-    """
-    from collections import Counter
-
-    # Count events per day
-    day_counts: Counter[str] = Counter()
-    for evt in events:
-        uts = evt.get("utimestamp")
-        if uts:
-            try:
-                dt = datetime.fromtimestamp(int(uts))
-                day_counts[dt.strftime("%d %b")] += 1
-            except (ValueError, TypeError, OSError):
-                continue
-
-    if not day_counts:
-        # Empty chart with message
-        fig, ax = plt.subplots(figsize=(CHART_WIDTH, CHART_HEIGHT))
-        ax.text(0.5, 0.5, "No event data available",
-                ha="center", va="center", fontsize=14, color=COLORS["unknown"])
-        ax.set_title("Event Timeline", fontweight="bold")
-        fig.tight_layout()
-        fig.savefig(str(output_path), dpi=CHART_DPI)
-        plt.close(fig)
-        return str(Path(output_path).resolve())
-
-    days = sorted(day_counts.keys())
-    counts = [day_counts[d] for d in days]
-
-    fig, ax = plt.subplots(figsize=(CHART_WIDTH, CHART_HEIGHT))
-    bars = ax.bar(days, counts, color=COLORS["primary"], edgecolor="white", linewidth=0.5)
-    ax.set_title("Events per Day", fontweight="bold")
-    ax.set_ylabel("Event Count")
-    ax.set_xlabel("Day")
-    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-
-    # Value labels on bars
-    for bar, val in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                str(val), ha="center", va="bottom", fontsize=8, fontweight="bold")
+    # Add avg line
+    if values:
+        avg = sum(values) / len(values)
+        unit = "%" if max(values) <= 100 else ""
+        ax.axhline(y=avg, color=color, linestyle="--", linewidth=0.7, alpha=0.5)
+        ax.text(timestamps[-1], avg, f"  avg {avg:.1f}{unit}",
+                fontsize=6, color=color, va="center", alpha=0.8)
 
     fig.autofmt_xdate()
-    fig.tight_layout()
+    fig.tight_layout(pad=0.5)
     fig.savefig(str(output_path), dpi=CHART_DPI, bbox_inches="tight")
     plt.close(fig)
     return str(Path(output_path).resolve())
 
 
-# ── Document builder ───────────────────────────────────────────────────────
+# ── Document builder ──────────────────────────────────────────────────────
 
 class ReportBuilder:
-    """Builds a monthly report .docx file.
+    """Builds the Resources Usage Metric Report .docx matching reference format.
 
     Usage::
 
         builder = ReportBuilder(
-            tenant_name="ACA_Insurance",
-            period="June 2026",
-            date_start="2026-06-01",
-            date_end="2026-06-30",
-            output_dir=Path("/opt/pandora-monthly-report/backend/output"),
+            tenant_name="PT Asuransi Central Asia [ACA]",
+            period="Mei 2026",
+            output_dir=Path(".../output"),
         )
-        builder.add_executive_summary(agents, events)
-        builder.add_availability(agents)
-        builder.add_alerts_section(events)
-        builder.save("ACA_Insurance_2026-06")
+        for agent in agents:
+            modules = await client.discover_agent_modules(agent["id_agente"])
+            builder.add_vm_block(agent, modules)
+        path = builder.save("ACA_Mei_2026")
     """
 
     def __init__(
         self,
         tenant_name: str,
         period: str,
-        date_start: str,
-        date_end: str,
         output_dir: Path,
     ) -> None:
         self.tenant_name = tenant_name
         self.period = period
-        self.date_start = date_start
-        self.date_end = date_end
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.doc = Document()
-        self._chart_paths: list[str] = []  # Track temp chart files for cleanup
+        self._chart_paths: list[str] = []
+        self._vm_count = 0
 
-        # Narrow margins
-        for section in self.doc.sections:
-            section.top_margin = Inches(0.8)
-            section.bottom_margin = Inches(0.8)
-            section.left_margin = Inches(1.0)
-            section.right_margin = Inches(1.0)
+        # Page setup — portrait A4, moderate margins
+        section = self.doc.sections[0]
+        section.top_margin = Inches(0.7)
+        section.bottom_margin = Inches(0.7)
+        section.left_margin = Inches(0.9)
+        section.right_margin = Inches(0.9)
 
-        # Style defaults
+        # Style
         style = self.doc.styles["Normal"]
-        style.font.name = "Calibri"
+        style.font.name = "Arial"
         style.font.size = Pt(10)
 
-        self._add_cover()
+        self._add_header()
 
-    # ── Cover ──────────────────────────────────────────────────────────
-
-    def _add_cover(self) -> None:
-        """Add cover page with tenant name and period."""
-        # Spacer
-        for _ in range(4):
-            self.doc.add_paragraph("")
-
+    def _add_header(self) -> None:
+        """Title + subtitle matching reference format."""
+        # Title
         title = self.doc.add_paragraph()
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title.add_run("Monthly Infrastructure Report")
-        run.font.size = Pt(28)
+        run = title.add_run("Resources Usage Metric Report")
+        run.font.size = Pt(24)
         run.font.bold = True
-        run.font.color.rgb = RGBColor(0x0D, 0x6E, 0xFD)
+        run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        run.font.name = "Arial"
 
+        # Spacer
         self.doc.add_paragraph("")
 
-        tenant_para = self.doc.add_paragraph()
-        tenant_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = tenant_para.add_run(self.tenant_name)
-        run.font.size = Pt(20)
-        run.font.bold = True
-
-        period_para = self.doc.add_paragraph()
-        period_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = period_para.add_run(f"Period: {self.period}")
+        # Subtitle
+        sub = self.doc.add_paragraph()
+        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = sub.add_run(f"Report Period: {self.period}")
         run.font.size = Pt(14)
+        run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        run.font.name = "Arial"
+
+        # Tenant
+        tn = self.doc.add_paragraph()
+        tn.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = tn.add_run(self.tenant_name)
+        run.font.size = Pt(12)
         run.font.color.rgb = RGBColor(0x6C, 0x75, 0x7D)
+        run.font.name = "Arial"
 
         self.doc.add_paragraph("")
-        gen_para = self.doc.add_paragraph()
-        gen_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = gen_para.add_run(
-            f"Generated: {datetime.now().strftime('%d %B %Y, %H:%M')}"
-        )
-        run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(0xAD, 0xB5, 0xBD)
 
-        self.doc.add_page_break()
+        # Create table: 2 columns
+        self._table = self.doc.add_table(rows=1, cols=2)
+        self._table.style = "Table Grid"
+        # Header row
+        hdr = self._table.rows[0].cells
+        hdr[0].text = "Item"
+        hdr[1].text = "Usage Metric"
+        for p in hdr[0].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(12)
+                r.font.bold = True
+                r.font.name = "Arial"
+        for p in hdr[1].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(12)
+                r.font.bold = True
+                r.font.name = "Arial"
 
-    # ── Executive Summary ──────────────────────────────────────────────
-
-    def add_executive_summary(
-        self, agents: list[dict], events: list[dict]
+    def add_vm_block(
+        self,
+        agent: dict,
+        modules: list[dict],
+        temp_dir: str,
     ) -> None:
-        """Add section 2: Executive Summary."""
-        self.doc.add_heading("Executive Summary", level=1)
+        """Add one VM row + metric chart rows to the table."""
+        agent_alias = agent.get("alias", "Unknown")
+        agent_name = agent.get("name", "")
+        agent_id = agent.get("id_agente", "?")
 
-        # Count severities
-        sev: dict[str, int] = {"Critical": 0, "Warning": 0, "Info": 0, "Unknown": 0}
-        sev_map = {"4": "Critical", "3": "Warning", "2": "Info", "1": "Info", "0": "Info"}
-        for evt in events:
-            c = str(evt.get("criticity", ""))
-            key = sev_map.get(c, "Unknown")
-            sev[key] += 1
+        # ── VM header row ──────────────────────────────────────────
+        vm_row = self._table.add_row()
+        vm_label = vm_row.cells[0].paragraphs[0]
+        vm_label_run = vm_label.add_run("Virtual Machine")
+        vm_label_run.font.size = Pt(12)
+        vm_label_run.font.name = "Arial"
 
-        total_events = sum(sev.values())
-        total_agents = len(agents)
+        vm_value = vm_row.cells[1].paragraphs[0]
+        vm_value_run = vm_value.add_run(agent_alias)
+        vm_value_run.font.size = Pt(12)
+        vm_value_run.font.bold = True
+        vm_value_run.font.name = "Arial"
+        if agent_name:
+            vm_value.add_run(f"  [{agent_name}]").font.size = Pt(9)
 
-        # Summary paragraph
-        summary_text = (
-            f"This report covers {total_agents} agent(s) in tenant "
-            f"**{self.tenant_name}** for the period **{self.period}**. "
-            f"A total of {total_events} event(s) were recorded during this period."
-        )
-        self.doc.add_paragraph(summary_text)
+        self._vm_count += 1
 
-        # Key metrics box
-        self.doc.add_heading("Key Metrics", level=2)
-        table = self.doc.add_table(rows=1, cols=5)
-        table.style = "Light Shading Accent 1"
-        hdr = table.rows[0].cells
-        hdr[0].text = "Total Agents"
-        hdr[1].text = "Total Events"
-        hdr[2].text = "Critical"
-        hdr[3].text = "Warning"
-        hdr[4].text = "Info"
-        row = table.add_row().cells
-        row[0].text = str(total_agents)
-        row[1].text = str(total_events)
-        row[2].text = str(sev["Critical"])
-        row[3].text = str(sev["Warning"])
-        row[4].text = str(sev["Info"])
-
-        # Severity pie chart
-        sev_display = {k: v for k, v in sev.items() if v > 0}
-        if sev_display:
-            chart_path = self.output_dir / f"_chart_severity_{_safe_filename(self.tenant_name)}.png"
-            generate_severity_pie(sev_display, chart_path)
-            self._chart_paths.append(str(chart_path))
-            self.doc.add_paragraph("")
-            self.doc.add_picture(str(chart_path), width=Inches(4.5))
-            last_paragraph = self.doc.paragraphs[-1]
-            last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        self.doc.add_page_break()
-
-    # ── Availability ───────────────────────────────────────────────────
-
-    def add_availability(self, agents: list[dict]) -> None:
-        """Add section 3: Availability per agent table."""
-        self.doc.add_heading("Agent Availability", level=1)
-
-        if not agents:
-            self.doc.add_paragraph(
-                "No agent data available for this period."
-            )
+        # ── Module metric rows ─────────────────────────────────────
+        if not modules:
+            # No module data — just add a note
+            for label in ["CPU Utilization", "Memory Usage", "Disk C:/", "Disk D:/"]:
+                row = self._table.add_row()
+                row.cells[0].paragraphs[0].add_run(label).font.size = Pt(12)
+                no_data = row.cells[1].paragraphs[0]
+                no_data_run = no_data.add_run("No data")
+                no_data_run.font.size = Pt(12)
+                no_data_run.font.italic = True
             return
 
-        note = self.doc.add_paragraph()
-        run = note.add_run(
-            "Note: Uptime data is not directly available via Pandora "
-            "Community API. The table below lists all agents in this "
-            "tenant. For detailed uptime metrics, consider using the "
-            "Pandora Console directly."
-        )
-        run.font.size = Pt(9)
-        run.font.italic = True
-        run.font.color.rgb = RGBColor(0x6C, 0x75, 0x7D)
+        # Classify each module and generate chart
+        for mod in modules:
+            parts = mod.get("values", [])
+            module_id = mod.get("module_id", "?")
+            label, color = _classify_metric(parts)
 
-        self.doc.add_paragraph("")
+            row = self._table.add_row()
 
-        # Agent table
-        table = self.doc.add_table(rows=1, cols=5)
-        table.style = "Light Shading Accent 1"
-        hdr = table.rows[0].cells
-        hdr[0].text = "Agent Alias"
-        hdr[1].text = "OS"
-        hdr[2].text = "IP Address"
-        hdr[3].text = "Description"
-        hdr[4].text = "Agent ID"
+            # Label cell
+            label_cell = row.cells[0].paragraphs[0]
+            label_run = label_cell.add_run(label)
+            label_run.font.size = Pt(12)
+            label_run.font.name = "Arial"
 
-        for agent in agents:
-            row = table.add_row().cells
-            row[0].text = agent.get("alias", "N/A")
-            row[1].text = agent.get("name", "N/A")
-            row[2].text = agent.get("direccion", "N/A")
-            row[3].text = (agent.get("comentarios") or "")[:60]
-            row[4].text = str(agent.get("id_agente", "N/A"))
+            # Chart cell
+            chart_path = Path(temp_dir) / f"_chart_{agent_id}_{module_id}.png"
+            result = generate_metric_chart(parts, label, color, chart_path)
+            if result:
+                self._chart_paths.append(result)
+                # Embed in cell
+                chart_para = row.cells[1].paragraphs[0]
+                chart_run = chart_para.add_run()
+                chart_run.add_picture(str(chart_path), width=Inches(CHART_W_INCHES))
+            else:
+                row.cells[1].paragraphs[0].add_run(
+                    "No chart data"
+                ).font.size = Pt(10)
 
-        # Auto-fit — set column widths
-        widths = [Inches(2.0), Inches(0.8), Inches(1.3), Inches(2.5), Inches(0.7)]
-        for row in table.rows:
-            for idx, width in enumerate(widths):
-                row.cells[idx].width = width
-
-        self.doc.add_page_break()
-
-    # ── Alerts & Events ────────────────────────────────────────────────
-
-    def add_alerts_section(self, events: list[dict]) -> None:
-        """Add section 5: Alerts & Events breakdown."""
-        self.doc.add_heading("Alerts & Events", level=1)
-
-        if not events:
-            self.doc.add_paragraph("No events recorded in this period.")
-            return
-
-        # Severity breakdown
-        sev_map = {"4": "Critical", "3": "Warning", "2": "Info", "1": "Info", "0": "Info"}
-        sev_counts: dict[str, int] = {"Critical": 0, "Warning": 0, "Info": 0}
-        for evt in events:
-            c = str(evt.get("criticity", ""))
-            key = sev_map.get(c, "Info")
-            sev_counts[key] += 1
-
-        self.doc.add_heading("Severity Breakdown", level=2)
-        table = self.doc.add_table(rows=1, cols=3)
-        table.style = "Light Shading Accent 1"
-        hdr = table.rows[0].cells
-        hdr[0].text = "Severity"
-        hdr[1].text = "Count"
-        hdr[2].text = "Percentage"
-        total = max(sum(sev_counts.values()), 1)
-        for sev_name, count in sev_counts.items():
-            row = table.add_row().cells
-            row[0].text = sev_name
-            row[1].text = str(count)
-            row[2].text = f"{count / total * 100:.1f}%"
-
-        self.doc.add_paragraph("")
-
-        # Event timeline chart
-        chart_path = self.output_dir / f"_chart_timeline_{_safe_filename(self.tenant_name)}.png"
-        generate_events_timeline(events, chart_path)
-        self._chart_paths.append(str(chart_path))
-        self.doc.add_picture(str(chart_path), width=Inches(6.5))
-        last_paragraph = self.doc.paragraphs[-1]
-        last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        self.doc.add_paragraph("")
-
-        # Latest events table (max 20)
-        self.doc.add_heading("Recent Events", level=2)
-        events_sorted = sorted(
-            events,
-            key=lambda e: int(e.get("utimestamp", "0")),
-            reverse=True,
-        )
-        table = self.doc.add_table(rows=1, cols=5)
-        table.style = "Light Shading Accent 1"
-        hdr = table.rows[0].cells
-        hdr[0].text = "Timestamp"
-        hdr[1].text = "Agent"
-        hdr[2].text = "Severity"
-        hdr[3].text = "Type"
-        hdr[4].text = "Description"
-
-        for evt in events_sorted[:20]:
-            row = table.add_row().cells
-            row[0].text = evt.get("timestamp", "N/A")
-            row[1].text = evt.get("agent_name", "N/A")
-            row[2].text = evt.get("criticity_name", str(evt.get("criticity", "?")))
-            row[3].text = evt.get("event_type", "N/A")
-            desc = (evt.get("evento") or "")[:100]
-            row[4].text = desc
-
-        self.doc.add_page_break()
-
-    # ── Footer ─────────────────────────────────────────────────────────
-
-    def _add_footer(self) -> None:
-        """Add footer with generation info."""
-        self.doc.add_heading("Notes", level=1)
-        self.doc.add_paragraph(
-            f"This report was automatically generated by Pandora Monthly Report "
-            f"on {datetime.now().strftime('%d %B %Y at %H:%M')}."
-        )
-        self.doc.add_paragraph(
-            "Data source: Pandora FMS Community Edition v7.0 NG — External API."
-        )
-        self.doc.add_paragraph(
-            "Note: Community Edition has limited API capabilities. "
-            "Some metrics (CPU, RAM, Disk) may not be available."
-        )
-
-        # Disclaimer
-        disclaimer = self.doc.add_paragraph()
-        run = disclaimer.add_run(
-            "This is an automatically generated document. "
-            "Please verify critical data against the Pandora Console."
-        )
-        run.font.size = Pt(8)
-        run.font.italic = True
-        run.font.color.rgb = RGBColor(0xAD, 0xB5, 0xBD)
-
-    # ── Save & cleanup ─────────────────────────────────────────────────
+        # Set column widths
+        for row_obj in self._table.rows:
+            row_obj.cells[0].width = Inches(1.8)
+            row_obj.cells[1].width = Inches(6.0)
 
     def save(self, filename_stem: str) -> str:
-        """Finalise the document, save to output_dir, and return the path.
+        """Save document and return path."""
+        safe = _safe_filename(filename_stem)
+        path = self.output_dir / f"{safe}.docx"
+        i = 1
+        while path.exists():
+            path = self.output_dir / f"{safe}_{i}.docx"
+            i += 1
 
-        Args:
-            filename_stem: Base filename without extension.
+        self.doc.save(str(path))
+        logger.info("Saved report: %s (%d VMs)", path, self._vm_count)
 
-        Returns:
-            Absolute path to the generated .docx file.
-        """
-        self._add_footer()
-
-        # Ensure unique filename
-        safe_name = _safe_filename(filename_stem)
-        output_path = self.output_dir / f"{safe_name}.docx"
-        counter = 1
-        while output_path.exists():
-            output_path = self.output_dir / f"{safe_name}_{counter}.docx"
-            counter += 1
-
-        self.doc.save(str(output_path))
-        logger.info("Report saved to %s", output_path)
-
-        # Clean up temp chart files
+        # Cleanup chart files
         for cp in self._chart_paths:
             try:
                 os.unlink(cp)
             except OSError:
                 pass
 
-        return str(output_path.resolve())
+        return str(path.resolve())
 
 
 # ── Top-level convenience ──────────────────────────────────────────────────
@@ -511,49 +380,46 @@ class ReportBuilder:
 def build_report(
     tenant_name: str,
     period: str,
-    date_start: str,
-    date_end: str,
     agents: list[dict],
-    events: list[dict],
+    agent_modules_map: dict[int, list[dict]],
     output_dir: str | Path,
 ) -> str:
-    """Generate a complete monthly report .docx in one call.
+    """Generate the Resources Usage Metric Report.
 
     Args:
-        tenant_name: Display name of the tenant/group.
-        period: Human-readable period, e.g. "June 2026".
-        date_start: Start date "YYYY-MM-DD".
-        date_end: End date "YYYY-MM-DD".
+        tenant_name: E.g. "PT Asuransi Central Asia [ACA]"
+        period: E.g. "Mei 2026"
         agents: List of agent dicts from PandoraClient.
-        events: List of event dicts from PandoraClient.
-        output_dir: Directory to save the .docx file.
+        agent_modules_map: ``{agent_id: [module_dict, ...]}`` from
+            ``PandoraClient.discover_agent_modules()``.
+        output_dir: Where to save the .docx.
 
     Returns:
-        Absolute path to the generated .docx file.
+        Absolute path to the generated file.
     """
-    builder = ReportBuilder(
-        tenant_name=tenant_name,
-        period=period,
-        date_start=date_start,
-        date_end=date_end,
-        output_dir=Path(output_dir),
-    )
-    builder.add_executive_summary(agents, events)
-    builder.add_availability(agents)
-    builder.add_alerts_section(events)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-    safe_tenant = _safe_filename(tenant_name)
-    safe_period = period.replace(" ", "_")
-    filename = f"{safe_tenant}_{safe_period}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        builder = ReportBuilder(
+            tenant_name=tenant_name,
+            period=period,
+            output_dir=out,
+        )
+        for agent in agents:
+            agent_id_raw = agent.get("id_agente")
+            if agent_id_raw is None:
+                continue
+            aid = int(agent_id_raw)
+            mods = agent_modules_map.get(aid, [])
+            builder.add_vm_block(agent, mods, tmpdir)
 
-    return builder.save(filename)
+        safe_tenant = _safe_filename(tenant_name)
+        safe_period = period.replace(" ", "_")
+        return builder.save(f"{safe_tenant}_{safe_period}")
 
-
-# ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _safe_filename(name: str) -> str:
-    """Sanitize a string for use in a filename."""
-    import re
     name = name.strip().replace(" ", "_")
-    name = re.sub(r"[^\w\-_.]", "", name)
+    name = re.sub(r"[^\w\-_.\[\]]", "", name)
     return name or "report"

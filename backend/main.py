@@ -34,7 +34,6 @@ from config import (
 )
 from models import GroupInfo, ReportRequest, ReportResponse, ReportStatus
 from pandora_client import PandoraAPIError, PandoraAuthError, PandoraClient
-from report_builder import build_report
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -146,11 +145,11 @@ async def list_groups():
 
 @app.post("/api/report/generate", response_model=ReportResponse)
 async def generate_report(req: ReportRequest):
-    """Generate a monthly report for a specific tenant + month.
+    """Generate a monthly Resources Usage Metric Report.
 
     1. Fetch agents for the group.
-    2. Fetch events for the group in the date range.
-    3. Build the .docx report.
+    2. Discover metric modules per agent (sequential ID scan).
+    3. Build the .docx report with per-VM charts.
     """
     client = _get_client()
 
@@ -158,8 +157,6 @@ async def generate_report(req: ReportRequest):
     year = req.year
     month = req.month
     last_day = calendar.monthrange(year, month)[1]
-    date_start = f"{year:04d}-{month:02d}-01"
-    date_end = f"{year:04d}-{month:02d}-{last_day:02d}"
     month_name = calendar.month_name[month]
     period = f"{month_name} {year}"
     group_name = req.group_name or f"Group {req.id_group}"
@@ -184,26 +181,37 @@ async def generate_report(req: ReportRequest):
                 message="No agents found in this group for the selected period.",
             )
 
-        # 2. Fetch events for this group in the date range
-        events = await client.get_events(
-            id_group=int(req.id_group),
-            date_start=date_start,
-            date_end=date_end,
-        )
+        # 2. Discover metric modules for each agent
+        agent_modules_map: dict[int, list[dict]] = {}
+        for agent in agents:
+            aid = agent.get("id_agente")
+            if aid is None:
+                continue
+            aid_int = int(aid)
+            mods = await client.discover_agent_modules(aid_int)
+            if mods:
+                agent_modules_map[aid_int] = mods
+                logger.info(
+                    "Agent %s (%s): %d modules discovered",
+                    aid, agent.get("alias", "?"), len(mods),
+                )
+            else:
+                agent_modules_map[aid_int] = []
+
+        total_modules = sum(len(m) for m in agent_modules_map.values())
 
         logger.info(
-            "Data: %d agents, %d events for '%s' / %s",
-            len(agents), len(events), group_name, period,
+            "Data: %d agents, %d modules for '%s' / %s",
+            len(agents), total_modules, group_name, period,
         )
 
         # 3. Build the .docx report
-        output_path = build_report(
+        from report_builder import build_report as build_usage_report
+        output_path = build_usage_report(
             tenant_name=group_name,
             period=period,
-            date_start=date_start,
-            date_end=date_end,
             agents=agents,
-            events=events,
+            agent_modules_map=agent_modules_map,
             output_dir=OUTPUT_DIR,
         )
 
@@ -217,8 +225,8 @@ async def generate_report(req: ReportRequest):
             tenant_name=group_name,
             period=period,
             total_agents=len(agents),
-            total_events=len(events),
-            message="Report generated successfully.",
+            total_events=total_modules,
+            message=f"Report generated with {total_modules} metric charts for {len(agents)} agents.",
         )
 
     except PandoraAuthError:

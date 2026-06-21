@@ -605,8 +605,7 @@ class PandoraClient:
         values appear in events for this agent.
 
         This is necessarily incomplete — only modules that fired events
-        will appear. For a complete module listing, a full scan of all
-        ``module_data`` IDs may be needed (slow).
+        will appear.
         """
         events = await self.get_events()
         module_ids: set[int] = set()
@@ -621,3 +620,73 @@ class PandoraClient:
             if evt_agent == int(agent_id) and evt_module > 0:
                 module_ids.add(evt_module)
         return sorted(module_ids)
+
+    async def discover_agent_modules(
+        self, agent_id: int, scan_range: int = 12,
+    ) -> list[dict]:
+        """Discover all modules for an agent by scanning around known IDs.
+
+        Modules are sequential in Pandora — scanning ±``scan_range``
+        around a known ``id_agentmodule`` from events reveals all
+        modules belonging to this agent.
+
+        Args:
+            agent_id: Pandora agent ID.
+            scan_range: How many IDs to scan in each direction.
+
+        Returns:
+            List of module dicts with keys:
+              - ``module_id`` (int)
+              - ``values`` (list[str]) — raw value strings from module_data
+              - ``data_points`` (int) — count of data points returned
+        """
+        known_ids = await self.get_agent_module_ids(agent_id)
+        if not known_ids:
+            return []
+
+        # Modules are sequential; scan around the first known ID
+        center = known_ids[0]
+        start = max(1, center - scan_range)
+        end = center + scan_range
+
+        found: list[dict] = []
+        for mid in range(start, end + 1):
+            try:
+                raw = await self._raw_module_data(mid)
+            except PandoraAPIError:
+                continue
+            if not raw or raw.startswith("No data"):
+                continue
+            # Parse the data: "timestampvalue timestampvalue ..."
+            parts = raw.strip().split()
+            if len(parts) >= 2:  # need at least 1 data point
+                found.append({
+                    "module_id": mid,
+                    "values": parts,
+                    "data_points": len(parts),
+                })
+
+        return found
+
+    async def _raw_module_data(self, module_id: int) -> str:
+        """Fetch raw module_data text without parsing.
+
+        Community Edition returns space-separated ``utimestampvalue``
+        pairs (e.g. ``178201193295.27000``) — no JSON wrapper.
+        """
+        params: dict[str, Any] = {
+            "op": "get",
+            "op2": "module_data",
+            "user": self.api_user,
+            "pass": self.api_pass,
+            "apipass": self.api_password,
+            "return_type": "json",
+            "id": str(module_id),
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(self.base_url, params=params)
+            resp.raise_for_status()
+        text = resp.text.strip()
+        if not text or text.startswith("No data"):
+            return ""
+        return text
