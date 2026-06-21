@@ -655,7 +655,7 @@ class PandoraClient:
         return sorted(module_ids)
 
     async def discover_agent_modules(
-        self, agent_id: int, scan_range: int = 12,
+        self, agent_id: int, scan_range: int = 8,
     ) -> list[dict]:
         """Discover all modules for an agent by scanning around known IDs.
 
