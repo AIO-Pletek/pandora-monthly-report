@@ -109,13 +109,23 @@ async def main() -> None:
     first_group_name = "N/A"
     if groups:
         first = groups[0]
-        # Pandora uses different key names across versions
+        if not isinstance(first, dict):
+            print(f"  ⚠ Unexpected group format (not dict): {first!r}")
+            print("  Skipping agent/event tests.")
+            return
+        # Pandora uses different key names across versions.
+        # Fallback extraction may return {"id", "name"} format.
         first_group_id = (
             first.get("id_grupo")
             or first.get("id_group")
             or first.get("id")
         )
-        first_group_name = first.get("nombre") or first.get("name", "N/A")
+        first_group_name = (
+            first.get("nombre")
+            or first.get("name")
+            or first.get("group_name")
+            or "N/A"
+        )
         print(f"\n  → Will use group id={first_group_id} ('{first_group_name}') for next tests")
 
     if first_group_id is None:
@@ -133,8 +143,13 @@ async def main() -> None:
 
     # ── Step 4: Modules for first agent ───────────────────────────────
     if agents:
-        first_agent_id = agents[0].get("id_agente")
-        first_agent_name = agents[0].get("alias") or agents[0].get("nombre", "N/A")
+        first_agent = agents[0]
+        if not isinstance(first_agent, dict):
+            print(f"  ⚠ Unexpected agent format (not dict): {first_agent!r}")
+            print("  Skipping module/event tests.")
+            return
+        first_agent_id = first_agent.get("id_agente")
+        first_agent_name = first_agent.get("alias") or first_agent.get("nombre", "N/A")
         print_section(
             f"4. Modules for agent {first_agent_id} ('{first_agent_name}') "
             f"(op2=get_agent_modules)"
@@ -149,9 +164,16 @@ async def main() -> None:
         modules = []
 
     # ── Step 5: Module data for first module ──────────────────────────
+    first_mod_id = None
+    first_mod_name = "N/A"
     if modules:
-        first_mod_id = modules[0].get("id_agente_modulo")
-        first_mod_name = modules[0].get("nombre", "N/A")
+        first_mod = modules[0]
+        if not isinstance(first_mod, dict):
+            print(f"  ⚠ Unexpected module format (not dict): {first_mod!r}")
+        else:
+            first_mod_id = first_mod.get("id_agente_modulo")
+            first_mod_name = first_mod.get("nombre", "N/A")
+    if first_mod_id:
         print_section(
             f"5. Data for module {first_mod_id} ('{first_mod_name}') "
             f"last 7 days (op2=module_data)"

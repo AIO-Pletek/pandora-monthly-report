@@ -78,6 +78,49 @@ def _parse_test_response(text: str) -> dict:
     }
 
 
+def _is_error_response(data: dict | list | str, op2: str) -> bool:
+    """Detect Pandora error messages that come back as valid JSON.
+
+    Pandora v7.0 NG returns errors like:
+      - ``["This operation does not exist."]``
+      - ``["No agents found in this group."]``
+      - ``{"error": "..."}``
+
+    Returns True if ``data`` looks like an error, not real data.
+    """
+    # Dict with error key
+    if isinstance(data, dict) and "error" in data:
+        return True
+    # List where all items are strings that look like error messages
+    if isinstance(data, list) and len(data) > 0:
+        all_strings = all(isinstance(item, str) for item in data)
+        if all_strings:
+            error_patterns = [
+                "does not exist",
+                "no such",
+                "not found",
+                "no agents",
+                "error",
+                "invalid",
+                "auth",
+                "acl",
+                "permission",
+            ]
+            combined = " ".join(data).lower()
+            if any(pat in combined for pat in error_patterns):
+                return True
+    return False
+
+
+def _format_error(data) -> str:
+    """Format error response into a readable string."""
+    if isinstance(data, list):
+        return " / ".join(str(item) for item in data)
+    if isinstance(data, dict) and "error" in data:
+        return str(data["error"])
+    return str(data)[:500]
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _to_module_date(date_str: str) -> str:
     """Convert human-readable date (YYYY-MM-DD) to module_data format.
@@ -205,10 +248,16 @@ class PandoraClient:
         # Try JSON first.
         try:
             data = resp.json()
-            # Pandora sometimes wraps JSON in a dict with "error" key.
-            return data
         except json.JSONDecodeError:
             pass  # not JSON — try CSV
+        else:
+            # Check for error messages disguised as valid JSON.
+            # Pandora returns e.g. ["This operation does not exist."]
+            if _is_error_response(data, op2):
+                raise PandoraAPIError(
+                    f"Pandora rejected op2={op2}: {_format_error(data)}"
+                )
+            return data
 
         # Pandora v7.0 NG often ignores return_type=json and returns CSV.
         # The CSV format varies by operation:
@@ -265,26 +314,84 @@ class PandoraClient:
     async def get_groups(self) -> list[dict]:
         """Return all groups configured in Pandora.
 
-        Uses ``op2=get_groups`` — the standard operation for listing groups
-        in Pandora FMS v7+. If your version does not support ``get_groups``,
-        try :meth:`get_module_groups` instead.
+        Tries multiple op2 names because Pandora versions differ:
+          1. ``get_groups`` (newer versions)
+          2. ``module_groups`` (some v7.x)
+          3. **Fallback**: call ``all_agents`` without group filter and
+             extract unique groups from agent data.
 
-        Each group dict typically contains ``id_grupo``, ``nombre``, etc.
+        Each group dict typically contains ``id_grupo`` / ``nombre``,
+        or after fallback normalization ``id`` / ``name`` / ``id_os``.
         """
-        result = await self._call("get_groups")
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
-        return []
+        # Try known group-listing operations
+        for op2 in ("get_groups", "module_groups"):
+            try:
+                result = await self._call(op2)
+            except PandoraAPIError as e:
+                logger.info("op2=%s not available: %s", op2, e)
+                continue
+
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict) and "data" in result:
+                return result["data"]
+
+        # Fallback: extract groups from all_agents response
+        logger.info(
+            "No direct group-listing op2 worked — "
+            "extracting groups from all_agents"
+        )
+        return await self._get_groups_from_agents()
+
+    async def _get_groups_from_agents(self) -> list[dict]:
+        """Extract unique groups by fetching all agents without a group
+        filter. This is a last-resort fallback used only when no
+        group-listing operation works.
+
+        Internal-only — normal code MUST use :meth:`get_agents_by_group`
+        with an explicit ``id_group``.
+        """
+        try:
+            agents = await self._call("all_agents")
+        except PandoraAPIError:
+            logger.exception("all_agents without filter also failed")
+            return []
+
+        groups: dict[int, dict] = {}
+        for agent in agents:
+            gid = (
+                agent.get("id_grupo")
+                or agent.get("id_group")
+                or agent.get("group")
+            )
+            if gid is None:
+                continue
+            try:
+                gid = int(gid)
+            except (ValueError, TypeError):
+                continue
+            if gid not in groups:
+                groups[gid] = {
+                    "id": gid,
+                    "name": (
+                        agent.get("grupo")
+                        or agent.get("group_name")
+                        or agent.get("nombre_grupo")
+                        or f"Group {gid}"
+                    ),
+                }
+        return sorted(groups.values(), key=lambda g: g["id"])
 
     async def get_module_groups(self) -> list[dict]:
         """Return all module groups (alternative group listing).
 
-        Uses ``op2=module_groups``. Some Pandora versions expose group
-        listings through this endpoint instead of ``get_groups``.
+        Kept for backward compatibility — :meth:`get_groups` already
+        tries this op2 internally.
         """
-        result = await self._call("module_groups")
+        try:
+            result = await self._call("module_groups")
+        except PandoraAPIError:
+            return []
         if isinstance(result, list):
             return result
         if isinstance(result, dict) and "data" in result:
