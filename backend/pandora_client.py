@@ -690,8 +690,9 @@ class PandoraClient:
         ajax_url = self.base_url.rsplit("/", 2)[0] + "/ajax.php"
         form_data = {
             "page": "operation/agentes/ver_agente",
-            "get_modules_json": "1",
-            "id_agent": str(agent_id),
+            "get_modules_group_json": "1",
+            "id_module_group": "0",
+            "id_agents": str(agent_id),
         }
         try:
             async with httpx.AsyncClient(
@@ -725,111 +726,20 @@ class PandoraClient:
     async def discover_agent_modules(
         self, agent_id: int,
     ) -> list[dict]:
-        """Discover metric modules + data for an agent.
+        """Discover metric modules + data for an agent via events scan.
 
-        Strategy (Pandora Community Ed has NO per-agent module API):
-          1. Get module list via AJAX (returns ALL modules globally).
-          2. Filter aggressively: keep only CPU/Memory/Disk by name.
-          3. Pick at most 1 CPU + 1 Memory + 3 Disk = 5 modules.
-          4. Fetch module_data only for those 5.
-          5. If AJAX fails, fall back to event-based module IDs.
+        Pandora Community Ed has NO per-agent module API.  The AJAX
+        endpoint returns ALL modules globally (module IDs belong to
+        OTHER agents).  Therefore we rely exclusively on event-based
+        module discovery (sequential scan around known module IDs).
 
-        Returns list of dicts with:
-          ``module_id``, ``module_name``, ``data_points``,
-          ``count``, ``avg``, ``max_val``
+        For agents with no events, no module IDs are known — data is
+        fundamentally unavailable. These agents will show "No data".
         """
-        # 1. Get module list via AJAX
-        mod_list = await self.get_agent_modules_via_ajax(int(agent_id))
-        if not mod_list:
-            # Fallback: use event-based module IDs (already known to work)
-            return await self._discover_via_events(int(agent_id))
-
-        logger.info("Agent %s: got %d total modules via AJAX", agent_id, len(mod_list))
-
-        # 2. Categorize by name into CPU / Memory / Disk
-        cpu_mods: list[dict] = []
-        mem_mods: list[dict] = []
-        disk_mods: list[dict] = []
-
-        cpu_kw = ["cpu", "processor", "load average", "iowait"]
-        mem_kw = ["mem", "memory", "ram", "swap"]
-        disk_kw = ["disk", "storage"]
-
-        skip_kw = [
-            "ifadminstatus", "ifoperstatus", "ifinoctets", "ifoutoctets",
-            "traffic", "ifdescr", "ifname", "ifalias", "iftype",
-            "ifspeed", "ifphysaddress", "ifhighspeed", "ifindex",
-            "ether", "vlan", "bridge", "gigabit", "hundred",
-            "twenty", "ten-", "forty", "port-channel",
-            "host alive", "host latency", "host_live",
-            "icmp", "ping", "latency", "service", "status", "snmp",
-            "tcp", "udp", "connection", "queue", "unknown", "keepalive",
-            "ssh", "login", "cron", "syslog", "udev", "check port",
-            "lastlogin", "os users", "proctotal", "sshdaemon",
-            "temp_mount", "snap/", "/.temp", "proxmox-ve_",
-            "free_ram", "freedisk", "system_", "paloalto_session",
-            "ipsec", "keepalive",
-        ]
-
-        for mod in mod_list:
-            name = (mod.get("nombre") or "").lower()
-            # Skip non-metric
-            if any(kw in name for kw in skip_kw):
-                continue
-            # Categorize
-            if any(kw in name for kw in cpu_kw):
-                cpu_mods.append(mod)
-            elif any(kw in name for kw in mem_kw):
-                mem_mods.append(mod)
-            elif any(kw in name for kw in disk_kw):
-                disk_mods.append(mod)
-
-        # 3. Pick: first CPU, first Memory, first 3 Disk
-        picks: list[dict] = []
-        if cpu_mods:
-            picks.append(cpu_mods[0])
-        if mem_mods:
-            picks.append(mem_mods[0])
-        for d in disk_mods[:3]:
-            picks.append(d)
-
-        logger.info(
-            "Agent %s: CPU=%d Mem=%d Disk=%d → picked %d for fetch",
-            agent_id, len(cpu_mods), len(mem_mods), len(disk_mods), len(picks),
-        )
-
-        # 4. Fetch module_data only for picks
-        found: list[dict] = []
-        for mod in picks:
-            mid = mod.get("id_agente_modulo")
-            if mid is None:
-                continue
-            try:
-                raw = await self._raw_module_data(int(mid))
-            except PandoraAPIError:
-                continue
-            if not raw:
-                continue
-            points = _parse_module_data_tokens(raw)
-            if points:
-                found.append({
-                    "module_id": int(mid),
-                    "module_name": mod.get("nombre", f"Module {mid}"),
-                    "data_points": points,
-                    "count": len(points),
-                    "avg": sum(p["value"] for p in points) / len(points),
-                    "max_val": max(p["value"] for p in points),
-                })
-
-        if not found:
-            # Module IDs from global list didn't work — try events
-            logger.info("Agent %s: AJAX modules returned no data, trying events", agent_id)
-            return await self._discover_via_events(int(agent_id))
-
-        return found
+        return await self._discover_via_events(int(agent_id))
 
     async def _discover_via_events(self, agent_id: int) -> list[dict]:
-        """Fallback: find modules via events + sequential scan."""
+        """Find modules via events + sequential scan around known IDs."""
         events = await self._call("events")
         if isinstance(events, dict) and "data" in events:
             events = events["data"]
