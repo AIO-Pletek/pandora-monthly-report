@@ -635,64 +635,78 @@ class PandoraClient:
             return filtered[:limit]
         return filtered
 
-    # -- 3.6  Convenience: agents with modules (via events) -------------
+    # -- 3.6  Agent modules (internal AJAX API) ------------------------
 
-    async def get_agent_module_ids(
+    async def get_agent_modules_via_ajax(
         self, agent_id: int,
-    ) -> list[int]:
-        """Return module IDs for an agent, extracted from events."""
-        if not hasattr(self, "_all_agent_modules"):
-            await self._load_all_event_modules()
-        return self._all_agent_modules.get(agent_id, [])
-
-    async def _load_all_event_modules(self) -> dict[int, list[int]]:
-        """Load agent->module mapping from events, cached per client."""
-        events = await self._call("events")
-        if isinstance(events, dict) and "data" in events:
-            events = events["data"]
-        if not isinstance(events, list):
-            events = []
-
-        mapping: dict[int, list[int]] = {}
-        for evt in events:
-            if not isinstance(evt, dict):
-                continue
-            try:
-                aid = int(evt.get("id_agente") or 0)
-                mid = int(evt.get("id_agentmodule") or 0)
-            except (ValueError, TypeError):
-                continue
-            if aid and mid:
-                mapping.setdefault(aid, []).append(mid)
-        for v in mapping.values():
-            v.sort()
-        self._all_agent_modules = mapping
-        logger.info("Loaded modules for %d agents from events", len(mapping))
-        return mapping
-
-    async def discover_agent_modules(
-        self, agent_id: int, scan_range: int = 30,
     ) -> list[dict]:
-        """Discover modules for an agent by scanning around known IDs.
+        """Return all modules for an agent using Pandora's internal AJAX API.
 
-        **Hard limit of Pandora Community Edition:** only agents that
-        appear in events have discoverable module IDs. For other agents
-        we cannot know which modules belong to them — scanning around
-        random IDs would assign wrong modules to the wrong agent.
-        These agents will show empty results.
+        This is the same endpoint the Pandora Console uses to load module
+        lists. Returns module ``id_agente_modulo`` and ``nombre`` (name).
+
+        POST ``/pandora_console/ajax.php`` with form data:
+          page=operation/agentes/ver_agente
+          get_modules_group_json=1
+          id_module_group=0
+          id_agents=<agent_id>
         """
-        await self._load_all_event_modules()
-        known = self._all_agent_modules.get(int(agent_id), [])
-
-        if not known:
-            # Cannot discover modules for this agent — no events reference it
+        ajax_url = self.base_url.rsplit("/", 1)[0] + "/ajax.php"
+        form_data = {
+            "page": "operation/agentes/ver_agente",
+            "get_modules_group_json": "1",
+            "id_module_group": "0",
+            "id_agents": str(agent_id),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(ajax_url, data=form_data)
+                resp.raise_for_status()
+            modules = resp.json()
+            if isinstance(modules, dict):
+                # Some versions return {id: {nombre, ...}, ...}
+                result = []
+                for mid, info in modules.items():
+                    result.append({
+                        "id_agente_modulo": int(mid),
+                        "nombre": info.get("nombre", "") if isinstance(info, dict) else str(info),
+                    })
+                return result
+            if isinstance(modules, list):
+                return modules
+            return []
+        except Exception as e:
+            logger.warning("AJAX module fetch for agent %d failed: %s", agent_id, e)
             return []
 
-        center = known[0]
+    async def discover_agent_modules(
+        self, agent_id: int,
+    ) -> list[dict]:
+        """Discover all modules + data for an agent.
+
+        Uses internal AJAX API to get module list (with real names!),
+        then fetches ``module_data`` for each module ID.
+
+        Returns list of dicts with:
+          ``module_id``, ``module_name``, ``data_points``,
+          ``count``, ``avg``, ``max_val``
+        """
+        # 1. Get module list via internal AJAX API
+        mod_list = await self.get_agent_modules_via_ajax(int(agent_id))
+        if not mod_list:
+            logger.warning("Agent %s: no modules via AJAX API", agent_id)
+            return []
+
+        logger.info("Agent %s: got %d modules via AJAX", agent_id, len(mod_list))
+
+        # 2. Fetch module_data for each module
         found: list[dict] = []
-        for mid in range(max(1, center - scan_range), center + scan_range + 1):
+        for mod in mod_list:
+            mid = mod.get("id_agente_modulo")
+            if mid is None:
+                continue
             try:
-                raw = await self._raw_module_data(mid)
+                raw = await self._raw_module_data(int(mid))
             except PandoraAPIError:
                 continue
             if not raw:
@@ -700,7 +714,8 @@ class PandoraClient:
             points = _parse_module_data_tokens(raw)
             if points:
                 found.append({
-                    "module_id": mid,
+                    "module_id": int(mid),
+                    "module_name": mod.get("nombre", f"Module {mid}"),
                     "data_points": points,
                     "count": len(points),
                     "avg": sum(p["value"] for p in points) / len(points),
