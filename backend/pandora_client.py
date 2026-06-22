@@ -687,7 +687,7 @@ class PandoraClient:
         if not session_id:
             return []
 
-        ajax_url = self.base_url.rsplit("/", 1)[0] + "/ajax.php"
+        ajax_url = self.base_url.rsplit("/", 2)[0] + "/ajax.php"
         form_data = {
             "page": "operation/agentes/ver_agente",
             "get_modules_group_json": "1",
