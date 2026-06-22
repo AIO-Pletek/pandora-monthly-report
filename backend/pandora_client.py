@@ -642,29 +642,30 @@ class PandoraClient:
     ) -> list[dict]:
         """Return all modules for an agent using Pandora's internal AJAX API.
 
-        This is the same endpoint the Pandora Console uses to load module
-        lists. Returns module ``id_agente_modulo`` and ``nombre`` (name).
-
-        POST ``/pandora_console/ajax.php`` with form data:
-          page=operation/agentes/ver_agente
-          get_modules_group_json=1
-          id_module_group=0
-          id_agents=<agent_id>
+        POST ``/pandora_console/ajax.php`` with form data including auth.
         """
+        # URL: strip /include/api.php, add /ajax.php
         ajax_url = self.base_url.rsplit("/", 1)[0] + "/ajax.php"
         form_data = {
             "page": "operation/agentes/ver_agente",
             "get_modules_group_json": "1",
             "id_module_group": "0",
             "id_agents": str(agent_id),
+            # Auth — same credentials
+            "apipass": self.api_password,
+            "user": self.api_user,
+            "pass": self.api_pass,
         }
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(ajax_url, data=form_data)
                 resp.raise_for_status()
+            text = resp.text.strip()
+            logger.debug("AJAX agent=%d: %s", agent_id, text[:200])
+            if not text or text == "null":
+                return []
             modules = resp.json()
             if isinstance(modules, dict):
-                # Some versions return {id: {nombre, ...}, ...}
                 result = []
                 for mid, info in modules.items():
                     result.append({
