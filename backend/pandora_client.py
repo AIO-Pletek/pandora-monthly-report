@@ -743,9 +743,58 @@ class PandoraClient:
 
         logger.info("Agent %s: got %d modules via AJAX", agent_id, len(mod_list))
 
-        # 2. Fetch module_data for each module
-        found: list[dict] = []
+        # 2. Filter: only fetch data for CPU / Memory / Disk metrics
+        ok_keywords = [
+            "cpu", "processor", "load average", "iowait",
+            "mem", "memory", "ram", "swap",
+            "disk", "storage",
+        ]
+        skip_keywords = [
+            "ifadminstatus", "ifoperstatus", "ifinoctets", "ifoutoctets",
+            "traffic", "ifdescr", "ifname", "ifalias", "iftype",
+            "ifspeed", "ifphysaddress", "ifhighspeed", "ifindex",
+            "host alive", "host latency", "host_live",
+            "icmp", "ping", "latency",
+            "service", "status", "snmp", "process",
+            "tcp", "udp", "connection",
+            "queue", "unknown", "keepalive",
+            "ssh", "login", "cron", "syslog", "udev",
+            "temp_mount", "snap/", "/.temp",
+        ]
+
+        relevant: list[dict] = []
+        skipped = 0
         for mod in mod_list:
+            name = (mod.get("nombre") or "").lower()
+            # Skip first (more specific)
+            skip = False
+            for kw in skip_keywords:
+                if kw in name:
+                    skip = True
+                    break
+            if skip:
+                skipped += 1
+                continue
+            # Must match CPU/Mem/Disk keywords
+            match = False
+            for kw in ok_keywords:
+                if kw in name:
+                    match = True
+                    break
+            if not match:
+                skipped += 1
+                continue
+            relevant.append(mod)
+
+        if skipped:
+            logger.info(
+                "Agent %s: skipped %d non-metric modules, %d relevant remain",
+                agent_id, skipped, len(relevant),
+            )
+
+        # 3. Fetch module_data only for relevant modules
+        found: list[dict] = []
+        for mod in relevant[:8]:  # max 8 metric modules per agent
             mid = mod.get("id_agente_modulo")
             if mid is None:
                 continue
