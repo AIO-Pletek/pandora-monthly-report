@@ -690,9 +690,8 @@ class PandoraClient:
         ajax_url = self.base_url.rsplit("/", 2)[0] + "/ajax.php"
         form_data = {
             "page": "operation/agentes/ver_agente",
-            "get_modules_group_json": "1",
-            "id_module_group": "0",
-            "id_agents": str(agent_id),
+            "get_modules_json": "1",
+            "id_agent": str(agent_id),
         }
         try:
             async with httpx.AsyncClient(
