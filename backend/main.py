@@ -31,7 +31,6 @@ from config import (
     PANDORA_API_USER,
     PANDORA_API_USER_PASS,
     PANDORA_BASE_URL,
-    PANDORA_SESSION_ID,
 )
 from models import GroupInfo, ReportRequest, ReportResponse, ReportStatus
 from pandora_client import PandoraAPIError, PandoraAuthError, PandoraClient
@@ -72,7 +71,6 @@ def _get_client() -> PandoraClient:
         api_user=PANDORA_API_USER,
         api_pass=PANDORA_API_USER_PASS,
         api_password=PANDORA_API_PASSWORD,
-        session_id=PANDORA_SESSION_ID,
     )
 
 

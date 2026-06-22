@@ -159,14 +159,12 @@ class PandoraClient:
         api_password: str,
         *,
         timeout: float = DEFAULT_TIMEOUT,
-        session_id: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/") + "/include/api.php"
         self.api_user = api_user
         self.api_pass = api_pass
         self.api_password = api_password
         self.timeout = timeout
-        self.session_id = session_id
 
     # ── Low-level call ──────────────────────────────────────────────────
 
@@ -637,18 +635,56 @@ class PandoraClient:
             return filtered[:limit]
         return filtered
 
-    # -- 3.6  Agent modules (internal AJAX API) ------------------------
+    # -- 3.6  Agent modules (auto-login + AJAX API) -------------------
+
+    async def _get_session_cookie(self) -> str:
+        """Auto-login to Pandora Console, return fresh PHPSESSID.
+
+        Posts to the web login form with API credentials, captures the
+        session cookie.  Cached for 20 minutes (PHP session is 24 min).
+        No manual PHPSESSID copy needed.
+        """
+        import time as _time
+        CACHE_KEY = "_session_cookie"
+        COOKIE_TTL = 1200  # 20 minutes
+
+        now = _time.time()
+        cached = getattr(self, CACHE_KEY, None)
+        if cached and (now - cached[1]) < COOKIE_TTL:
+            return cached[0]
+
+        login_url = self.base_url.rsplit("/", 2)[0] + "/index.php?login=1"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                resp = await client.post(login_url, data={
+                    "nick": self.api_user,
+                    "pass": self.api_pass,
+                    "login_button": "Login",
+                })
+            # Extract PHPSESSID from Set-Cookie header
+            set_cookie = resp.headers.get("set-cookie", "")
+            for part in set_cookie.split(";"):
+                part = part.strip()
+                if part.startswith("PHPSESSID="):
+                    session_id = part.split("=", 1)[1]
+                    setattr(self, CACHE_KEY, (session_id, now))
+                    logger.info("Auto-login to Pandora Console: OK")
+                    return session_id
+            logger.warning("Auto-login failed: no PHPSESSID in response")
+            return ""
+        except Exception as e:
+            logger.warning("Auto-login failed: %s", e)
+            return ""
 
     async def get_agent_modules_via_ajax(
         self, agent_id: int,
     ) -> list[dict]:
-        """Return all modules for an agent using Pandora's internal AJAX API.
+        """Return all modules for an agent using Pandora's AJAX API.
 
-        Requires a valid PHPSESSID cookie from a Pandora Console browser session
-        (set ``PANDORA_SESSION_ID`` in ``.env``).
+        Auto-login is handled transparently — no manual cookie setup.
         """
-        if not self.session_id:
-            logger.warning("No PANDORA_SESSION_ID set — cannot use AJAX API")
+        session_id = await self._get_session_cookie()
+        if not session_id:
             return []
 
         ajax_url = self.base_url.rsplit("/", 1)[0] + "/ajax.php"
@@ -658,14 +694,17 @@ class PandoraClient:
             "id_module_group": "0",
             "id_agents": str(agent_id),
         }
-        cookies = {"PHPSESSID": self.session_id}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, cookies=cookies) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                cookies={"PHPSESSID": session_id},
+            ) as client:
                 resp = await client.post(ajax_url, data=form_data)
                 resp.raise_for_status()
             text = resp.text.strip()
             logger.debug("AJAX agent=%d: %s", agent_id, text[:200])
             if not text or text == "null":
+                setattr(self, "_session_cookie", None)
                 return []
             modules = resp.json()
             if isinstance(modules, dict):
@@ -680,7 +719,8 @@ class PandoraClient:
                 return modules
             return []
         except Exception as e:
-            logger.warning("AJAX module fetch for agent %d failed: %s", agent_id, e)
+            logger.warning("AJAX agent %d failed: %s", agent_id, e)
+            setattr(self, "_session_cookie", None)
             return []
 
     async def discover_agent_modules(

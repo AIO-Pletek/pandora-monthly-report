@@ -22,7 +22,6 @@ PANDORA_BASE_URL: str = os.getenv(
 PANDORA_API_USER: str = os.getenv("PANDORA_API_USER", "")
 PANDORA_API_USER_PASS: str = os.getenv("PANDORA_API_USER_PASS", "")
 PANDORA_API_PASSWORD: str = os.getenv("PANDORA_API_PASSWORD", "")
-PANDORA_SESSION_ID: str = os.getenv("PANDORA_SESSION_ID", "")
 
 # ── Application ──────────────────────────────────────────────────
 APP_ENV: str = os.getenv("APP_ENV", "development")
