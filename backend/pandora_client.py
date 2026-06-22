@@ -673,59 +673,41 @@ class PandoraClient:
     async def discover_agent_modules(
         self, agent_id: int, scan_range: int = 30,
     ) -> list[dict]:
-        """Discover modules for an agent by sequential ID scan.
+        """Discover modules for an agent by scanning around known IDs.
 
-        **Pandora Community Edition limitation:** no ``agent_modules``
-        operation exists. Module IDs come only from events (40 items).
-        For agents without events, we scan around ALL known module IDs
-        as fallback — but this is imprecise (modules may belong to
-        other agents). Agents with truly no data will show empty results.
+        **Hard limit of Pandora Community Edition:** only agents that
+        appear in events have discoverable module IDs. For other agents
+        we cannot know which modules belong to them — scanning around
+        random IDs would assign wrong modules to the wrong agent.
+        These agents will show empty results.
         """
         await self._load_all_event_modules()
         known = self._all_agent_modules.get(int(agent_id), [])
 
-        # Centers: own module IDs first, then all known IDs as fallback
-        all_known = sorted(set(
-            mid for ids in self._all_agent_modules.values() for mid in ids
-        ))
-        centers = (known[:1] if known else []) + all_known
+        if not known:
+            # Cannot discover modules for this agent — no events reference it
+            return []
 
+        center = known[0]
         found: list[dict] = []
-        scanned: set[int] = set()
+        for mid in range(max(1, center - scan_range), center + scan_range + 1):
+            try:
+                raw = await self._raw_module_data(mid)
+            except PandoraAPIError:
+                continue
+            if not raw:
+                continue
+            points = _parse_module_data_tokens(raw)
+            if points:
+                found.append({
+                    "module_id": mid,
+                    "data_points": points,
+                    "count": len(points),
+                    "avg": sum(p["value"] for p in points) / len(points),
+                    "max_val": max(p["value"] for p in points),
+                })
 
-        for center in centers[:15]:  # max 15 centers to limit API calls
-            for mid in range(max(1, center - scan_range), center + scan_range + 1):
-                if mid in scanned:
-                    continue
-                scanned.add(mid)
-                try:
-                    raw = await self._raw_module_data(mid)
-                except PandoraAPIError:
-                    continue
-                if not raw:
-                    continue
-                points = _parse_module_data_tokens(raw)
-                if points:
-                    found.append({
-                        "module_id": mid,
-                        "data_points": points,
-                        "count": len(points),
-                        "avg": sum(p["value"] for p in points) / len(points),
-                        "max_val": max(p["value"] for p in points),
-                    })
-            if len(found) >= 8:  # enough modules, stop
-                break
-
-        # Deduplicate by module_id (just in case)
-        seen: set[int] = set()
-        unique: list[dict] = []
-        for m in found:
-            mid = m["module_id"]
-            if mid not in seen:
-                seen.add(mid)
-                unique.append(m)
-
-        return sorted(unique, key=lambda m: m["module_id"])
+        return sorted(found, key=lambda m: m["module_id"])
 
     async def _raw_module_data(self, module_id: int) -> str:
         """Fetch raw module_data text without parsing.
