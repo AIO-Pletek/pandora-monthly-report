@@ -9,7 +9,7 @@ async def main():
     # Force fresh login
     base = os.getenv("PANDORA_BASE_URL")
     login_url = base.rstrip("/") + "/index.php?login=1"
-    ajax_url = base.rsplit("/", 2)[0] + "/ajax.php"
+    ajax_url = base.rstrip("/") + "/ajax.php"
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=False) as c:
         # 1. Login
