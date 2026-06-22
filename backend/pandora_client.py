@@ -725,86 +725,82 @@ class PandoraClient:
     async def discover_agent_modules(
         self, agent_id: int,
     ) -> list[dict]:
-        """Discover all modules + data for an agent.
+        """Discover metric modules + data for an agent.
 
-        Uses internal AJAX API to get module list (with real names!),
-        then fetches ``module_data`` for each module ID.
+        Strategy (Pandora Community Ed has NO per-agent module API):
+          1. Get module list via AJAX (returns ALL modules globally).
+          2. Filter aggressively: keep only CPU/Memory/Disk by name.
+          3. Pick at most 1 CPU + 1 Memory + 3 Disk = 5 modules.
+          4. Fetch module_data only for those 5.
+          5. If AJAX fails, fall back to event-based module IDs.
 
         Returns list of dicts with:
           ``module_id``, ``module_name``, ``data_points``,
           ``count``, ``avg``, ``max_val``
         """
-        # 1. Get module list via internal AJAX API
+        # 1. Get module list via AJAX
         mod_list = await self.get_agent_modules_via_ajax(int(agent_id))
         if not mod_list:
-            logger.warning("Agent %s: no modules via AJAX API", agent_id)
-            return []
+            # Fallback: use event-based module IDs (already known to work)
+            return await self._discover_via_events(int(agent_id))
 
-        logger.info("Agent %s: got %d modules via AJAX", agent_id, len(mod_list))
+        logger.info("Agent %s: got %d total modules via AJAX", agent_id, len(mod_list))
 
-        # 2. Filter: only fetch data for genuine CPU / Memory / Disk metrics.
-        ok_keywords = [
-            "cpu", "processor", "load average", "iowait",
-            "mem", "memory", "ram",
-            "disk", "storage",
-        ]
-        skip_keywords = [
-            # Network interfaces
+        # 2. Categorize by name into CPU / Memory / Disk
+        cpu_mods: list[dict] = []
+        mem_mods: list[dict] = []
+        disk_mods: list[dict] = []
+
+        cpu_kw = ["cpu", "processor", "load average", "iowait"]
+        mem_kw = ["mem", "memory", "ram", "swap"]
+        disk_kw = ["disk", "storage"]
+
+        skip_kw = [
             "ifadminstatus", "ifoperstatus", "ifinoctets", "ifoutoctets",
             "traffic", "ifdescr", "ifname", "ifalias", "iftype",
             "ifspeed", "ifphysaddress", "ifhighspeed", "ifindex",
-            "ether", "vlan", "bridge-aggregation", "gigabit", "hundred",
-            "twenty-five", "ten-gigabit", "forty", "port-channel",
-            # Non-metric modules
+            "ether", "vlan", "bridge", "gigabit", "hundred",
+            "twenty", "ten-", "forty", "port-channel",
             "host alive", "host latency", "host_live",
-            "icmp", "ping", "latency",
-            "service", "status", "snmp",
-            "tcp", "udp", "connection",
-            "queue", "unknown", "keepalive",
-            "ssh", "login", "cron", "syslog", "udev",
-            "check port", "lastlogin", "os users",
-            # Temporary mounts / snapshots — not real disks
-            "temp_mount", "snap/", "/.temp",
-            # Proxmox VE aggregated modules (monitor OTHER agents)
-            "proxmox-ve_",
-            # Non-CPU processes
-            "proctotal", "sshdaemon", "cron task",
-            # Swap is fine
+            "icmp", "ping", "latency", "service", "status", "snmp",
+            "tcp", "udp", "connection", "queue", "unknown", "keepalive",
+            "ssh", "login", "cron", "syslog", "udev", "check port",
+            "lastlogin", "os users", "proctotal", "sshdaemon",
+            "temp_mount", "snap/", "/.temp", "proxmox-ve_",
+            "free_ram", "freedisk", "system_", "paloalto_session",
+            "ipsec", "keepalive",
         ]
 
-        relevant: list[dict] = []
-        skipped = 0
         for mod in mod_list:
             name = (mod.get("nombre") or "").lower()
-            # Skip first (more specific)
-            skip = False
-            for kw in skip_keywords:
-                if kw in name:
-                    skip = True
-                    break
-            if skip:
-                skipped += 1
+            # Skip non-metric
+            if any(kw in name for kw in skip_kw):
                 continue
-            # Must match CPU/Mem/Disk keywords
-            match = False
-            for kw in ok_keywords:
-                if kw in name:
-                    match = True
-                    break
-            if not match:
-                skipped += 1
-                continue
-            relevant.append(mod)
+            # Categorize
+            if any(kw in name for kw in cpu_kw):
+                cpu_mods.append(mod)
+            elif any(kw in name for kw in mem_kw):
+                mem_mods.append(mod)
+            elif any(kw in name for kw in disk_kw):
+                disk_mods.append(mod)
 
-        if skipped:
-            logger.info(
-                "Agent %s: skipped %d non-metric modules, %d relevant remain",
-                agent_id, skipped, len(relevant),
-            )
+        # 3. Pick: first CPU, first Memory, first 3 Disk
+        picks: list[dict] = []
+        if cpu_mods:
+            picks.append(cpu_mods[0])
+        if mem_mods:
+            picks.append(mem_mods[0])
+        for d in disk_mods[:3]:
+            picks.append(d)
 
-        # 3. Fetch module_data only for relevant modules
+        logger.info(
+            "Agent %s: CPU=%d Mem=%d Disk=%d → picked %d for fetch",
+            agent_id, len(cpu_mods), len(mem_mods), len(disk_mods), len(picks),
+        )
+
+        # 4. Fetch module_data only for picks
         found: list[dict] = []
-        for mod in relevant[:8]:  # max 8 metric modules per agent
+        for mod in picks:
             mid = mod.get("id_agente_modulo")
             if mid is None:
                 continue
@@ -819,6 +815,56 @@ class PandoraClient:
                 found.append({
                     "module_id": int(mid),
                     "module_name": mod.get("nombre", f"Module {mid}"),
+                    "data_points": points,
+                    "count": len(points),
+                    "avg": sum(p["value"] for p in points) / len(points),
+                    "max_val": max(p["value"] for p in points),
+                })
+
+        if not found:
+            # Module IDs from global list didn't work — try events
+            logger.info("Agent %s: AJAX modules returned no data, trying events", agent_id)
+            return await self._discover_via_events(int(agent_id))
+
+        return found
+
+    async def _discover_via_events(self, agent_id: int) -> list[dict]:
+        """Fallback: find modules via events + sequential scan."""
+        events = await self._call("events")
+        if isinstance(events, dict) and "data" in events:
+            events = events["data"]
+        if not isinstance(events, list):
+            events = []
+
+        known: set[int] = set()
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            try:
+                aid = int(evt.get("id_agente") or 0)
+                mid = int(evt.get("id_agentmodule") or 0)
+            except (ValueError, TypeError):
+                continue
+            if aid == agent_id and mid:
+                known.add(mid)
+
+        if not known:
+            return []
+
+        center = min(known)
+        found: list[dict] = []
+        for mid in range(max(1, center - 15), center + 15):
+            try:
+                raw = await self._raw_module_data(mid)
+            except PandoraAPIError:
+                continue
+            if not raw:
+                continue
+            points = _parse_module_data_tokens(raw)
+            if points:
+                found.append({
+                    "module_id": mid,
+                    "module_name": f"Module {mid}",
                     "data_points": points,
                     "count": len(points),
                     "avg": sum(p["value"] for p in points) / len(points),
