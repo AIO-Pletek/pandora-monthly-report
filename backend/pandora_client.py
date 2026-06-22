@@ -411,17 +411,15 @@ class PandoraClient:
         """Return agent IDs in a group via CSV all_agents filter.
 
         The ONLY way to filter agents by group in Community Ed.
-        Pipe chars MUST be URL-encoded (%7C) for other_mode to work.
+        Pipe separator is passed literally — httpx handles URL encoding.
         """
-        from urllib.parse import quote as _url_quote
-        other_val = _url_quote("|") + str(id_group) + _url_quote("|") + _url_quote("|||") + "0"
         agent_ids: list[int] = []
         try:
             params: dict[str, Any] = {
                 "op": "get", "op2": "all_agents",
                 "user": self.api_user, "pass": self.api_pass,
                 "apipass": self.api_password,
-                "other": other_val,
+                "other": f"|{id_group}|||||0",
                 "other_mode": "url_encode_separator_|",
                 "return_type": "csv",
             }
@@ -429,8 +427,6 @@ class PandoraClient:
                 r = await client.get(self.base_url, params=params)
             text = r.text.strip()
             logger.debug("Group %d raw CSV (first 300): %s", id_group, text[:300])
-            # Lines: first line is header, rest are data.
-            # Fields are concatenated; agent ID is the first numeric token.
             for ln in text.split("\n"):
                 ln = ln.strip()
                 if not ln:
@@ -441,7 +437,7 @@ class PandoraClient:
                         digits += ch
                     else:
                         break
-                if digits:
+                if digits and len(digits) <= 10:  # agent ID max 10 digits
                     agent_ids.append(int(digits))
         except Exception as e:
             logger.exception("Failed to get agents for group %s: %s", id_group, e)
