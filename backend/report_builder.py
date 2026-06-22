@@ -45,11 +45,24 @@ COLOR_DISK = "#DC3545"
 
 FONT_FAMILY = "DejaVu Sans"
 
-# Metric categories we care about. Everything else is skipped.
-_CPU_LABEL = "CPU Utilization"
-_MEM_LABEL = "Memory Usage"
-_DISK_LABELS = ["Disk Usage", "Disk Usage (2)", "Disk Usage (3)"]
-_MAX_DISK = 3
+# Metric categories we display. Order matters — first module of each
+# category gets the first label, second gets the second, etc.
+_CPU_LABELS = [
+    "CPU Utilization",
+    "CPU Load Average",
+    "CPU IOWait",
+    "CPU (4)",
+    "CPU (5)",
+]
+_MEM_LABELS = [
+    "Memory Usage",
+    "Memory Swap",
+    "Memory (3)",
+]
+_DISK_LABELS = ["Disk Usage", "Disk Usage (2)", "Disk Usage (3)", "Disk Usage (4)"]
+_MAX_DISK = 4
+_MAX_CPU = 3
+_MAX_MEM = 2
 
 
 def _classify_metric(
@@ -61,32 +74,32 @@ def _classify_metric(
     ``"cpu"``, ``"memory"``, ``"disk"``, or ``"skip"``.
 
     Heuristics (Pandora Community Ed has NO module names):
-      - CPU: values all ≤110  →  "CPU Utilization"
-      - Memory: median > 1000 OR value range suggests bytes/KB  →  "Memory Usage"
-      - Disk: values ≤110 (percentage) or mid-range  →  "Disk _:/"
+      - CPU: values all ≤110 (percentage or load avg)  →  category "cpu"
+      - Memory: median > 1000 OR value range suggests bytes/KB  →  "memory"
+      - Disk: medium values  →  "disk"
       - Skip: very large values (>10M, network bytes), or unable to classify
     """
     if not data_points:
-        return ("cpu", _CPU_LABEL, COLOR_CPU)
+        return ("cpu", _CPU_LABELS[0], COLOR_CPU)
 
     vals = sorted([p["value"] for p in data_points if p.get("value") is not None])
     if not vals:
-        return ("cpu", _CPU_LABEL, COLOR_CPU)
+        return ("cpu", _CPU_LABELS[0], COLOR_CPU)
 
     max_val = vals[-1]
     median = vals[len(vals) // 2]
     avg = sum(vals) / len(vals)
 
-    # CPU: all values ≤ 110 (percentage, some modules spike slightly above 100)
-    if max_val <= 110:
-        return ("cpu", _CPU_LABEL, COLOR_CPU)
+    # CPU: all values ≤ 150 (covers CPU %, load average, IOWait %)
+    if max_val <= 150:
+        return ("cpu", "", COLOR_CPU)
 
-    # Memory: typically large numbers (KB/MB/bytes) or very wide range
+    # Memory: typically large numbers (KB/MB/bytes)
     if max_val > 100000 or median > 1000 or (max_val > 500 and avg > 500):
-        return ("memory", _MEM_LABEL, COLOR_MEM)
+        return ("memory", "", COLOR_MEM)
 
-    # Disk: medium numbers (bytes/percentage/IOPS) or percentages ≤ 110
-    return ("disk", "", COLOR_DISK)  # label assigned later
+    # Disk: medium numbers
+    return ("disk", "", COLOR_DISK)
 
 
 def _should_show(category: str) -> bool:
@@ -302,9 +315,13 @@ class ReportBuilder:
 
         if not modules_sorted:
             self._add_no_data_row("CPU Utilization")
+            self._add_no_data_row("CPU Load Average")
+            self._add_no_data_row("CPU IOWait")
             self._add_no_data_row("Memory Usage")
+            self._add_no_data_row("Memory Swap")
             self._add_no_data_row("Disk Usage")
             self._add_no_data_row("Disk Usage (2)")
+            self._add_no_data_row("Disk Usage (3)")
             return
 
         # Classify each module → keep only CPU, Memory, Disk
@@ -323,28 +340,38 @@ class ReportBuilder:
                 disk_mods.append(mod)
             # else: skip (network, swap, unknown metrics)
 
-        # Build ordered display list: CPU → Memory → Disk C, D, E
+        # Build ordered display: all CPU → all Memory → all Disk
         to_display: list[tuple[str, str, dict]] = []  # (label, color, mod)
 
-        if cpu_mods:
-            to_display.append((_CPU_LABEL, COLOR_CPU, cpu_mods[0]))
-        else:
-            to_display.append((_CPU_LABEL, COLOR_CPU, {}))
+        # CPU modules (up to _MAX_CPU, min 3 slots)
+        for i, m in enumerate(cpu_mods):
+            if i >= _MAX_CPU:
+                break
+            label = _CPU_LABELS[i] if i < len(_CPU_LABELS) else f"CPU ({i + 1})"
+            to_display.append((label, COLOR_CPU, m))
+        for i in range(len(cpu_mods), 3):
+            label = _CPU_LABELS[i] if i < len(_CPU_LABELS) else f"CPU ({i + 1})"
+            to_display.append((label, COLOR_CPU, {}))
 
-        if mem_mods:
-            to_display.append((_MEM_LABEL, COLOR_MEM, mem_mods[0]))
-        else:
-            to_display.append((_MEM_LABEL, COLOR_MEM, {}))
+        # Memory modules (up to _MAX_MEM, min 2 slots)
+        for i, m in enumerate(mem_mods):
+            if i >= _MAX_MEM:
+                break
+            label = _MEM_LABELS[i] if i < len(_MEM_LABELS) else f"Memory ({i + 1})"
+            to_display.append((label, COLOR_MEM, m))
+        for i in range(len(mem_mods), 2):
+            label = _MEM_LABELS[i] if i < len(_MEM_LABELS) else f"Memory ({i + 1})"
+            to_display.append((label, COLOR_MEM, {}))
 
-        for i, dmod in enumerate(disk_mods):
+        # Disk modules (up to _MAX_DISK, min 3 slots)
+        for i, m in enumerate(disk_mods):
             if i >= _MAX_DISK:
                 break
-            to_display.append((_DISK_LABELS[i], COLOR_DISK, dmod))
-
-        # If fewer than 2 disk modules, fill remaining with "No data"
-        if len(disk_mods) < 2:
-            for i in range(len(disk_mods), 2):
-                to_display.append((_DISK_LABELS[i], COLOR_DISK, {}))
+            label = _DISK_LABELS[i] if i < len(_DISK_LABELS) else f"Disk ({i + 1})"
+            to_display.append((label, COLOR_DISK, m))
+        for i in range(len(disk_mods), 3):
+            label = _DISK_LABELS[i] if i < len(_DISK_LABELS) else f"Disk ({i + 1})"
+            to_display.append((label, COLOR_DISK, {}))
 
         for label, color, mod in to_display:
             all_points = mod.get("data_points", [])
