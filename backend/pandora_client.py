@@ -743,23 +743,34 @@ class PandoraClient:
 
         logger.info("Agent %s: got %d modules via AJAX", agent_id, len(mod_list))
 
-        # 2. Filter: only fetch data for CPU / Memory / Disk metrics
+        # 2. Filter: only fetch data for genuine CPU / Memory / Disk metrics.
         ok_keywords = [
             "cpu", "processor", "load average", "iowait",
-            "mem", "memory", "ram", "swap",
+            "mem", "memory", "ram",
             "disk", "storage",
         ]
         skip_keywords = [
+            # Network interfaces
             "ifadminstatus", "ifoperstatus", "ifinoctets", "ifoutoctets",
             "traffic", "ifdescr", "ifname", "ifalias", "iftype",
             "ifspeed", "ifphysaddress", "ifhighspeed", "ifindex",
+            "ether", "vlan", "bridge-aggregation", "gigabit", "hundred",
+            "twenty-five", "ten-gigabit", "forty", "port-channel",
+            # Non-metric modules
             "host alive", "host latency", "host_live",
             "icmp", "ping", "latency",
-            "service", "status", "snmp", "process",
+            "service", "status", "snmp",
             "tcp", "udp", "connection",
             "queue", "unknown", "keepalive",
             "ssh", "login", "cron", "syslog", "udev",
+            "check port", "lastlogin", "os users",
+            # Temporary mounts / snapshots — not real disks
             "temp_mount", "snap/", "/.temp",
+            # Proxmox VE aggregated modules (monitor OTHER agents)
+            "proxmox-ve_",
+            # Non-CPU processes
+            "proctotal", "sshdaemon", "cron task",
+            # Swap is fine
         ]
 
         relevant: list[dict] = []
