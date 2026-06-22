@@ -640,81 +640,73 @@ class PandoraClient:
     async def get_agent_module_ids(
         self, agent_id: int,
     ) -> list[int]:
-        """Return module IDs for an agent, extracted from events.
+        """Return module IDs for an agent, extracted from events."""
+        if not hasattr(self, "_all_agent_modules"):
+            await self._load_all_event_modules()
+        return self._all_agent_modules.get(agent_id, [])
 
-        Since Community Edition has no ``agent_modules`` operation,
-        we discover module IDs by looking at which ``id_agentmodule``
-        values appear in events for this agent.
+    async def _load_all_event_modules(self) -> dict[int, list[int]]:
+        """Load agent->module mapping from events, cached per client."""
+        events = await self._call("events")
+        if isinstance(events, dict) and "data" in events:
+            events = events["data"]
+        if not isinstance(events, list):
+            events = []
 
-        This is necessarily incomplete — only modules that fired events
-        will appear.
-        """
-        events = await self.get_events()
-        module_ids: set[int] = set()
+        mapping: dict[int, list[int]] = {}
         for evt in events:
             if not isinstance(evt, dict):
                 continue
             try:
-                evt_agent = int(evt.get("id_agente") or 0)
-                evt_module = int(evt.get("id_agentmodule") or 0)
+                aid = int(evt.get("id_agente") or 0)
+                mid = int(evt.get("id_agentmodule") or 0)
             except (ValueError, TypeError):
                 continue
-            if evt_agent == int(agent_id) and evt_module > 0:
-                module_ids.add(evt_module)
-        return sorted(module_ids)
+            if aid and mid:
+                mapping.setdefault(aid, []).append(mid)
+        for v in mapping.values():
+            v.sort()
+        self._all_agent_modules = mapping
+        logger.info("Loaded modules for %d agents from events", len(mapping))
+        return mapping
 
     async def discover_agent_modules(
-        self, agent_id: int, scan_range: int = 8,
+        self, agent_id: int, scan_range: int = 15,
     ) -> list[dict]:
-        """Discover all modules for an agent by scanning around known IDs.
+        """Discover modules for an agent by sequential scan."""
+        await self._load_all_event_modules()
+        known = self._all_agent_modules.get(int(agent_id), [])
 
-        Modules are sequential in Pandora — scanning ±``scan_range``
-        around a known ``id_agentmodule`` from events reveals all
-        modules belonging to this agent.
-
-        Each token from Pandora is ``timestamp(10) + value`` concatenated
-        without delimiter, e.g. ``178201193295.27000`` → ts=1782011932, val=95.27.
-
-        Args:
-            agent_id: Pandora agent ID.
-            scan_range: How many IDs to scan in each direction.
-
-        Returns:
-            List of module dicts with keys:
-              - ``module_id`` (int)
-              - ``data_points`` (list of dicts: ``{timestamp, value}``)
-              - ``avg`` (float) — average value
-              - ``max_val`` (float) — maximum value
-        """
-        known_ids = await self.get_agent_module_ids(agent_id)
-        if not known_ids:
-            return []
-
-        # Modules are sequential; scan around the first known ID
-        center = known_ids[0]
-        start = max(1, center - scan_range)
-        end = center + scan_range
+        # If no known modules, try ALL known IDs as centers (fallback)
+        centers = known[:1] if known else sorted(set(
+            mid for ids in self._all_agent_modules.values() for mid in ids
+        ))[:5]
 
         found: list[dict] = []
-        for mid in range(start, end + 1):
-            try:
-                raw = await self._raw_module_data(mid)
-            except PandoraAPIError:
-                continue
-            if not raw:
-                continue
-            points = _parse_module_data_tokens(raw)
-            if not points:
-                continue
-            avg = sum(p["value"] for p in points) / len(points)
-            max_val = max(p["value"] for p in points)
-            found.append({
-                "module_id": mid,
-                "data_points": points,
-                "count": len(points),
-                "avg": avg,
-                "max_val": max_val,
-            })
+        scanned: set[int] = set()
+
+        for center in centers:
+            for mid in range(max(1, center - scan_range), center + scan_range + 1):
+                if mid in scanned:
+                    continue
+                scanned.add(mid)
+                try:
+                    raw = await self._raw_module_data(mid)
+                except PandoraAPIError:
+                    continue
+                if not raw:
+                    continue
+                points = _parse_module_data_tokens(raw)
+                if points:
+                    found.append({
+                        "module_id": mid,
+                        "data_points": points,
+                        "count": len(points),
+                        "avg": sum(p["value"] for p in points) / len(points),
+                        "max_val": max(p["value"] for p in points),
+                    })
+            if found and known:
+                break  # only scan first center if we have a known ID
 
         return found
 
