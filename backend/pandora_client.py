@@ -159,12 +159,14 @@ class PandoraClient:
         api_password: str,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        session_id: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/") + "/include/api.php"
         self.api_user = api_user
         self.api_pass = api_pass
         self.api_password = api_password
         self.timeout = timeout
+        self.session_id = session_id
 
     # ── Low-level call ──────────────────────────────────────────────────
 
@@ -642,22 +644,23 @@ class PandoraClient:
     ) -> list[dict]:
         """Return all modules for an agent using Pandora's internal AJAX API.
 
-        POST ``/pandora_console/ajax.php`` with form data including auth.
+        Requires a valid PHPSESSID cookie from a Pandora Console browser session
+        (set ``PANDORA_SESSION_ID`` in ``.env``).
         """
-        # URL: strip /include/api.php, add /ajax.php
+        if not self.session_id:
+            logger.warning("No PANDORA_SESSION_ID set — cannot use AJAX API")
+            return []
+
         ajax_url = self.base_url.rsplit("/", 1)[0] + "/ajax.php"
         form_data = {
             "page": "operation/agentes/ver_agente",
             "get_modules_group_json": "1",
             "id_module_group": "0",
             "id_agents": str(agent_id),
-            # Auth — same credentials
-            "apipass": self.api_password,
-            "user": self.api_user,
-            "pass": self.api_pass,
         }
+        cookies = {"PHPSESSID": self.session_id}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, cookies=cookies) as client:
                 resp = await client.post(ajax_url, data=form_data)
                 resp.raise_for_status()
             text = resp.text.strip()
