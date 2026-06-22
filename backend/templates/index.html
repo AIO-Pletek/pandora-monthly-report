@@ -186,7 +186,7 @@
                     for (const g of data.groups) {
                         const opt = document.createElement('option');
                         opt.value = g.id;
-                        opt.textContent = `${g.name} (${g.agent_count} agents)`;
+                        opt.textContent = `${g.name}`;
                         groupSelect.appendChild(opt);
                     }
                 } else {
