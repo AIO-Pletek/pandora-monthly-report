@@ -384,7 +384,6 @@ class PandoraClient:
             if isinstance(events, dict) and "data" in events:
                 events = events["data"]
             if isinstance(events, list):
-                # Count agents per group
                 agent_groups: dict[int, set[int]] = defaultdict(set)
                 for evt in events:
                     if not isinstance(evt, dict):
@@ -402,9 +401,44 @@ class PandoraClient:
         except PandoraAPIError:
             pass
 
+        # Note: agent_count is 0 initially — counted on-demand via
+        # _count_agents_in_group() to keep get_groups() fast (1 API call).
         result = sorted(groups.values(), key=lambda g: str(g.get("name", "")))
         logger.info("get_groups: %d total groups", len(result))
         return result
+
+    async def _get_agent_ids_for_group(self, id_group: int) -> list[int]:
+        """Return agent IDs in a group via CSV all_agents filter.
+
+        The ONLY way to filter agents by group in Community Ed.
+        """
+        agent_ids: list[int] = []
+        try:
+            params: dict[str, Any] = {
+                "op": "get", "op2": "all_agents",
+                "user": self.api_user, "pass": self.api_pass,
+                "apipass": self.api_password,
+                "other": f"|{id_group}|||||",
+                "other_mode": "url_encode_separator_|",
+                "return_type": "csv",
+            }
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.get(self.base_url, params=params)
+            for ln in r.text.strip().split("\n"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                digits = ""
+                for ch in ln:
+                    if ch.isdigit():
+                        digits += ch
+                    else:
+                        break
+                if digits:
+                    agent_ids.append(int(digits))
+        except Exception as e:
+            logger.exception("Failed to get agents for group %s: %s", id_group, e)
+        return agent_ids
 
     # -- 3.3  Agents ----------------------------------------------------
 
@@ -429,17 +463,14 @@ class PandoraClient:
     async def get_agents_for_group(
         self, id_group: int,
     ) -> list[dict]:
-        """Return ALL agents for report generation.
+        """Return agents in a group using CSV all_agents filter."""
+        agent_ids = set(await self._get_agent_ids_for_group(id_group))
+        logger.info("Group %d: %d agent IDs from CSV filter", id_group, len(agent_ids))
+        if not agent_ids:
+            return []
 
-        Pandora Community Edition has NO server-side agent→group filter
-        and events (40 items) are too sparse to reliably map agents to
-        groups.  Therefore we return all agents for every group — the
-        report will list all monitored VMs.
-
-        Args:
-            id_group: Group ID (used only for logging).
-        """
-        return await self.get_agents()
+        all_agents = await self.get_agents()
+        return [a for a in all_agents if int(a.get("id_agente", 0)) in agent_ids]
 
     # -- 3.4  Module data -----------------------------------------------
 
