@@ -635,119 +635,29 @@ class PandoraClient:
             return filtered[:limit]
         return filtered
 
-    # -- 3.6  Agent modules (auto-login + AJAX API) -------------------
-
-    async def _get_session_cookie(self) -> str:
-        """Auto-login to Pandora Console, return fresh PHPSESSID.
-
-        Posts to the web login form with API credentials, captures the
-        session cookie.  Cached for 20 minutes (PHP session is 24 min).
-        No manual PHPSESSID copy needed.
-        """
-        import time as _time
-        CACHE_KEY = "_session_cookie"
-        COOKIE_TTL = 1200  # 20 minutes
-
-        now = _time.time()
-        cached = getattr(self, CACHE_KEY, None)
-        if cached and (now - cached[1]) < COOKIE_TTL:
-            return cached[0]
-
-        login_url = self.base_url.rsplit("/", 2)[0] + "/index.php?login=1"
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
-                resp = await client.post(login_url, data={
-                    "nick": self.api_user,
-                    "pass": self.api_pass,
-                    "login_button": "Login",
-                })
-            # Extract PHPSESSID from Set-Cookie header
-            set_cookie = resp.headers.get("set-cookie", "")
-            for part in set_cookie.split(";"):
-                part = part.strip()
-                if part.startswith("PHPSESSID="):
-                    session_id = part.split("=", 1)[1]
-                    setattr(self, CACHE_KEY, (session_id, now))
-                    logger.info("Auto-login to Pandora Console: OK")
-                    return session_id
-            logger.warning("Auto-login failed: no PHPSESSID in response")
-            return ""
-        except Exception as e:
-            logger.warning("Auto-login failed: %s", e)
-            return ""
-
-    async def get_agent_modules_via_ajax(
-        self, agent_id: int,
-    ) -> list[dict]:
-        """Return all modules for an agent using Pandora's AJAX API.
-
-        Auto-login is handled transparently — no manual cookie setup.
-        """
-        session_id = await self._get_session_cookie()
-        if not session_id:
-            return []
-
-        ajax_url = self.base_url.rsplit("/", 2)[0] + "/ajax.php"
-        form_data = {
-            "page": "operation/agentes/ver_agente",
-            "get_modules_group_json": "1",
-            "id_module_group": "0",
-            "id_agents": str(agent_id),
-        }
-        try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                cookies={"PHPSESSID": session_id},
-            ) as client:
-                resp = await client.post(ajax_url, data=form_data)
-                resp.raise_for_status()
-            text = resp.text.strip()
-            logger.debug("AJAX agent=%d: %s", agent_id, text[:200])
-            if not text or text == "null":
-                setattr(self, "_session_cookie", None)
-                return []
-            modules = resp.json()
-            if isinstance(modules, dict):
-                result = []
-                for mid, info in modules.items():
-                    result.append({
-                        "id_agente_modulo": int(mid),
-                        "nombre": info.get("nombre", "") if isinstance(info, dict) else str(info),
-                    })
-                return result
-            if isinstance(modules, list):
-                return modules
-            return []
-        except Exception as e:
-            logger.warning("AJAX agent %d failed: %s", agent_id, e)
-            setattr(self, "_session_cookie", None)
-            return []
+    # -- 3.6  Agent modules (events-based discovery) -----------------
 
     async def discover_agent_modules(
         self, agent_id: int,
     ) -> list[dict]:
         """Discover metric modules + data for an agent via events scan.
 
-        Pandora Community Ed has NO per-agent module API.  The AJAX
-        endpoint returns ALL modules globally (module IDs belong to
-        OTHER agents).  Therefore we rely exclusively on event-based
-        module discovery (sequential scan around known module IDs).
+        Pandora Community Ed has NO per-agent module API (tested
+        exhaustively: agent_modules, AJAX, all return global data).
+        We rely on event-based module discovery — scanning module IDs
+        that appear in events for this agent.
 
-        For agents with no events, no module IDs are known — data is
-        fundamentally unavailable. These agents will show "No data".
+        For agents with no events: no module IDs available → empty result.
         """
-        return await self._discover_via_events(int(agent_id))
-
-    async def _discover_via_events(self, agent_id: int) -> list[dict]:
-        """Find modules via events + sequential scan around known IDs."""
-        events = await self._call("events")
-        if isinstance(events, dict) and "data" in events:
-            events = events["data"]
-        if not isinstance(events, list):
-            events = []
+        # Cache events (fetched once per client instance for all agents)
+        if not hasattr(self, "_cached_events"):
+            raw = await self._call("events")
+            if isinstance(raw, dict) and "data" in raw:
+                raw = raw["data"]
+            self._cached_events = raw if isinstance(raw, list) else []
 
         known: set[int] = set()
-        for evt in events:
+        for evt in self._cached_events:
             if not isinstance(evt, dict):
                 continue
             try:
@@ -755,7 +665,7 @@ class PandoraClient:
                 mid = int(evt.get("id_agentmodule") or 0)
             except (ValueError, TypeError):
                 continue
-            if aid == agent_id and mid:
+            if aid == int(agent_id) and mid:
                 known.add(mid)
 
         if not known:
