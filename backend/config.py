@@ -27,6 +27,13 @@ PANDORA_API_PASSWORD: str = os.getenv("PANDORA_API_PASSWORD", "")
 APP_ENV: str = os.getenv("APP_ENV", "development")
 APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
 
+# ── Pandora Database (MySQL, read-only) ──────────────────────────
+PANDORA_DB_HOST: str = os.getenv("PANDORA_DB_HOST", "localhost")
+PANDORA_DB_PORT: int = int(os.getenv("PANDORA_DB_PORT", "3306"))
+PANDORA_DB_USER: str = os.getenv("PANDORA_DB_USER", "")
+PANDORA_DB_PASS: str = os.getenv("PANDORA_DB_PASS", "")
+PANDORA_DB_NAME: str = os.getenv("PANDORA_DB_NAME", "pandora")
+
 # ── Paths ────────────────────────────────────────────────────────
 BASE_DIR: Path = Path(__file__).resolve().parent
 OUTPUT_DIR: Path = BASE_DIR / "output"

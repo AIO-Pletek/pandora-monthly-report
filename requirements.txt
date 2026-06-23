@@ -18,3 +18,6 @@ python-multipart>=0.0.9,<1.0.0
 # Environment config
 pydantic-settings>=2.2.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0
+
+# MySQL (read-only access to Pandora database)
+pymysql>=1.1.0,<2.0.0

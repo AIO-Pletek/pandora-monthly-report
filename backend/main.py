@@ -66,11 +66,30 @@ def _render_template(name: str, **ctx) -> HTMLResponse:
 
 def _get_client() -> PandoraClient:
     """Create a PandoraClient from environment config."""
+    from config import (
+        PANDORA_DB_HOST, PANDORA_DB_PORT, PANDORA_DB_USER,
+        PANDORA_DB_PASS, PANDORA_DB_NAME,
+    )
+    from db_client import PandoraDB
+
+    db = None
+    if PANDORA_DB_USER and PANDORA_DB_PASS:
+        try:
+            db = PandoraDB(
+                host=PANDORA_DB_HOST, port=PANDORA_DB_PORT,
+                user=PANDORA_DB_USER, password=PANDORA_DB_PASS,
+                database=PANDORA_DB_NAME,
+            )
+            logger.info("PandoraDB connected")
+        except Exception as e:
+            logger.warning("PandoraDB unavailable: %s", e)
+
     return PandoraClient(
         base_url=PANDORA_BASE_URL,
         api_user=PANDORA_API_USER,
         api_pass=PANDORA_API_USER_PASS,
         api_password=PANDORA_API_PASSWORD,
+        db=db,
     )
 
 

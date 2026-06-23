@@ -159,12 +159,14 @@ class PandoraClient:
         api_password: str,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        db: Any | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/") + "/include/api.php"
         self.api_user = api_user
         self.api_pass = api_pass
         self.api_password = api_password
         self.timeout = timeout
+        self.db = db  # PandoraDB instance (optional, for Community Ed)
 
     # ── Low-level call ──────────────────────────────────────────────────
 
@@ -331,351 +333,165 @@ class PandoraClient:
     async def get_groups(self) -> list[dict]:
         """Return all groups (tenants) for UI dropdown.
 
-        Uses ``op2=groups`` (CSV) — the only operation that lists ALL groups
-        in Pandora Community Ed.  Falls back to module_groups + events.
-
-        Returns list of dicts with ``id``, ``name``, ``agent_count``.
+        DB first (instant, complete), API fallback.
         """
-        # Source 1: op2=groups (CSV) — most complete
+        # DB path (preferred)
+        if self.db:
+            try:
+                rows = self.db.get_groups()
+                result = []
+                for r in rows:
+                    gid = r.get("id_grupo")
+                    count = self.db.get_agent_count_by_group(gid)
+                    result.append({
+                        "id": gid, "name": r.get("nombre", f"Group {gid}"),
+                        "agent_count": count,
+                    })
+                if result:
+                    logger.info("get_groups: %d from DB", len(result))
+                    return sorted(result, key=lambda g: str(g["name"]))
+            except Exception as e:
+                logger.warning("DB groups failed: %s, falling back to API", e)
+
+        # API fallback (same as before)
+        return await self._get_groups_via_api()
+
+    async def _get_groups_via_api(self) -> list[dict]:
+        """Get groups via Pandora API (fallback when no DB)."""
         groups: dict[int, dict] = {}
         try:
-            params: dict[str, Any] = {
-                "op": "get",
-                "op2": "groups",
-                "user": self.api_user,
-                "pass": self.api_pass,
-                "apipass": self.api_password,
-                "return_type": "csv",
-            }
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(self.base_url, params=params)
-                resp.raise_for_status()
-            raw = resp.text.strip()
-            for line in raw.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
+            params = {"op":"get","op2":"groups","user":self.api_user,
+                      "pass":self.api_pass,"apipass":self.api_password,"return_type":"csv"}
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                r = await c.get(self.base_url, params=params)
+            for line in r.text.strip().split("\n"):
+                if not line.strip(): continue
                 parts = line.split(";")
                 if len(parts) >= 2 and parts[0].isdigit():
-                    gid = int(parts[0])
-                    gname = parts[1]
-                    groups[gid] = {"id": gid, "name": gname, "agent_count": 0}
-            if groups:
-                logger.info("Got %d groups from op2=groups", len(groups))
+                    groups[int(parts[0])] = {"id": int(parts[0]), "name": parts[1], "agent_count": 0}
         except Exception as e:
-            logger.info("op2=groups failed: %s, trying module_groups", e)
-
-        # Source 2: module_groups (fallback)
-        if not groups:
-            try:
-                mgroups = await self.get_module_groups()
-                for g in mgroups:
-                    gid = g.get("id")
-                    if isinstance(gid, int):
-                        groups[gid] = {"id": gid, "name": g.get("name", f"Group {gid}"), "agent_count": 0}
-                if groups:
-                    logger.info("Got %d groups from module_groups", len(groups))
-            except Exception as e:
-                logger.info("module_groups failed: %s", e)
-
-        # Source 3: events (enrich with agent counts where possible)
-        try:
-            events = await self._call("events")
-            if isinstance(events, dict) and "data" in events:
-                events = events["data"]
-            if isinstance(events, list):
-                agent_groups: dict[int, set[int]] = defaultdict(set)
-                for evt in events:
-                    if not isinstance(evt, dict):
-                        continue
-                    aid = evt.get("id_agente")
-                    gid = evt.get("id_grupo")
-                    if aid and gid:
-                        try:
-                            agent_groups[int(gid)].add(int(aid))
-                        except (ValueError, TypeError):
-                            pass
-                for gid, aids in agent_groups.items():
-                    if gid in groups:
-                        groups[gid]["agent_count"] = len(aids)
-        except PandoraAPIError:
-            pass
-
-        # Note: agent_count is 0 initially — counted on-demand via
-        # _count_agents_in_group() to keep get_groups() fast (1 API call).
-        result = sorted(groups.values(), key=lambda g: str(g.get("name", "")))
-        logger.info("get_groups: %d total groups", len(result))
-        return result
-
-    async def _get_agent_ids_for_group(self, id_group: int) -> list[int]:
-        """Return agent IDs in a group via CSV all_agents filter.
-
-        The ONLY way to filter agents by group in Community Ed.
-        Pipe separator is passed literally — httpx handles URL encoding.
-        """
-        agent_ids: list[int] = []
-        try:
-            params: dict[str, Any] = {
-                "op": "get", "op2": "all_agents",
-                "user": self.api_user, "pass": self.api_pass,
-                "apipass": self.api_password,
-                "other": f"|{id_group}|||||0",
-                "other_mode": "url_encode_separator_|",
-                "return_type": "csv",
-            }
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                r = await client.get(self.base_url, params=params)
-            text = r.text.strip()
-            logger.debug("Group %d raw CSV (first 300): %s", id_group, text[:300])
-            for ln in text.split("\n"):
-                ln = ln.strip()
-                if not ln:
-                    continue
-                digits = ""
-                for ch in ln:
-                    if ch.isdigit():
-                        digits += ch
-                    else:
-                        break
-                if digits and len(digits) <= 10:  # agent ID max 10 digits
-                    agent_ids.append(int(digits))
-        except Exception as e:
-            logger.exception("Failed to get agents for group %s: %s", id_group, e)
-        return agent_ids
+            logger.info("op2=groups failed: %s", e)
+        return sorted(groups.values(), key=lambda g: str(g["name"]))
 
     # -- 3.3  Agents ----------------------------------------------------
 
     async def get_agents(self) -> list[dict]:
-        """Return ALL agents from Pandora.
-
-        Community Edition has no server-side group filter for agents.
-        Use :meth:`get_agents_for_group` to filter by group client-side.
-
-        Returns:
-            List of agent dicts with keys:
-            ``id_agente``, ``alias``, ``name`` (OS), ``direccion``,
-            ``comentarios``, ``nombre``, ``url_address``.
-        """
+        """Return ALL agents."""
+        if self.db:
+            try:
+                rows = self.db.get_agents()
+                result = []
+                for r in rows:
+                    result.append({
+                        "id_agente": r.get("id_agente"),
+                        "alias": r.get("alias", ""),
+                        "name": "",  # not in DB
+                        "direccion": r.get("direccion", ""),
+                        "comentarios": r.get("comentarios", ""),
+                        "url_address": "",
+                        "nombre": "",
+                        "id_grupo": r.get("id_grupo"),
+                        "grupo_nombre": r.get("grupo_nombre", ""),
+                    })
+                return result
+            except Exception as e:
+                logger.warning("DB agents failed: %s", e)
+        # API fallback
         agents = await self._call("all_agents")
-        if isinstance(agents, list):
-            return agents
-        if isinstance(agents, dict) and "data" in agents:
-            return agents["data"]
+        if isinstance(agents, list): return agents
+        if isinstance(agents, dict) and "data" in agents: return agents["data"]
         return []
 
-    async def get_agents_for_group(
-        self, id_group: int,
-    ) -> list[dict]:
-        """Return agents in a group using CSV all_agents filter."""
-        agent_ids = set(await self._get_agent_ids_for_group(id_group))
-        logger.info("Group %d: %d agent IDs from CSV filter", id_group, len(agent_ids))
-        if not agent_ids:
-            return []
+    async def get_agents_for_group(self, id_group: int) -> list[dict]:
+        """Return agents in a group."""
+        if self.db:
+            try:
+                rows = self.db.get_agents_by_group(int(id_group))
+                result = []
+                for r in rows:
+                    result.append({
+                        "id_agente": r.get("id_agente"),
+                        "alias": r.get("alias", ""),
+                        "name": "",
+                        "direccion": r.get("direccion", ""),
+                        "comentarios": r.get("comentarios", ""),
+                        "url_address": "",
+                        "nombre": "",
+                    })
+                logger.info("Group %d: %d agents from DB", id_group, len(result))
+                return result
+            except Exception as e:
+                logger.warning("DB agents_by_group failed: %s", e)
+        # API fallback
+        return await self._get_agents_for_group_via_api(int(id_group))
 
+    async def _get_agents_for_group_via_api(self, id_group: int) -> list[dict]:
+        """Fallback: use CSV all_agents filter."""
+        agent_ids: set[int] = set()
+        try:
+            params = {"op":"get","op2":"all_agents","user":self.api_user,
+                      "pass":self.api_pass,"apipass":self.api_password,
+                      "other":f"|{id_group}|||||0","other_mode":"url_encode_separator_|",
+                      "return_type":"csv"}
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                r = await c.get(self.base_url, params=params)
+            for ln in r.text.strip().split("\n"):
+                d = "".join(ch for ch in ln.strip() if ch.isdigit())
+                if d and len(d) <= 10:
+                    agent_ids.add(int(d))
+        except Exception as e:
+            logger.exception("CSV filter failed: %s", e)
         all_agents = await self.get_agents()
         return [a for a in all_agents if int(a.get("id_agente", 0)) in agent_ids]
 
-    # -- 3.4  Module data -----------------------------------------------
+    # -- 3.4  Agent modules (DB: real names, real IDs) -----------------
 
-    async def get_module_data(
-        self,
-        module_id: int,
-        date_start: str,
-        date_end: str,
-        *,
-        period: int = 0,
-    ) -> list[dict]:
-        """Return historical data points for a single module.
+    async def discover_agent_modules(self, agent_id: int) -> list[dict]:
+        """Discover metric modules + data for an agent.
 
-        Uses ``op2=module_data&id=<module_id>``.
-
-        For Community Edition, ``other`` / ``other_mode`` params are NOT
-        compatible — they cause "Error in the parameters".  We rely on
-        ``return_type=json`` and filter client-side if needed.
-
-        Args:
-            module_id: Module ID (from events' ``id_agentmodule``).
-            date_start: Start date ``"YYYY-MM-DD"``.
-            date_end: End date ``"YYYY-MM-DD"``.
-            period: Not used in Community Ed (ignored).
-
-        Returns:
-            List of data-point dicts. Each may contain ``utimestamp``,
-            ``datos`` (value), etc. Empty list if no data.
+        DB path: query tagente_modulo directly → get real names + IDs.
+        API fallback: events-based sequential scan.
         """
-        # Try JSON first (no other/other_mode params)
-        result = await self._call("module_data", id_=str(module_id))
-        if isinstance(result, list):
-            data = result
-        elif isinstance(result, dict) and "data" in result:
-            data = result["data"]
-        else:
-            data = []
+        if self.db:
+            return await self._discover_via_db(int(agent_id))
+        return await self._discover_via_events(int(agent_id))
 
-        # Filter client-side by date range
-        if data and date_start and date_end:
-            ts_start = _to_unix(date_start, end_of_day=False)
-            ts_end = _to_unix(date_end, end_of_day=True)
-            filtered = []
-            for dp in data:
-                if not isinstance(dp, dict):
-                    continue
-                uts = dp.get("utimestamp")
-                if uts is not None:
-                    try:
-                        uts_int = int(uts)
-                    except (ValueError, TypeError):
-                        continue
-                    if ts_start <= uts_int <= ts_end:
-                        filtered.append(dp)
-            return filtered
+    async def _discover_via_db(self, agent_id: int) -> list[dict]:
+        """Get modules from DB, fetch data from API."""
+        try:
+            rows = self.db.get_agent_modules(agent_id)
+        except Exception as e:
+            logger.warning("DB modules failed: %s", e)
+            return await self._discover_via_events(agent_id)
 
-        return data
-
-    # -- 3.5  Events / alerts -------------------------------------------
-
-    async def get_events(
-        self,
-        *,
-        id_group: int | None = None,
-        date_start: str | None = None,
-        date_end: str | None = None,
-        criticity: int | None = None,
-        event_type: str | None = None,
-        status: int | None = None,
-        limit: int = 0,
-    ) -> list[dict]:
-        """Return events from Pandora, optionally filtered.
-
-        Community Edition does NOT support ``other`` / ``other_mode``
-        params for events — they cause "Error in the parameters".
-        All filtering is done client-side.
-
-        Args:
-            id_group: Filter by group ID (events' ``id_grupo``).
-            date_start: Start date ``"YYYY-MM-DD"``.
-            date_end: End date ``"YYYY-MM-DD"``.
-            criticity: Severity filter (0=info, 1=low, 2=medium, 3=warning, 4=critical).
-            event_type: ``"alert_fired"``, ``"alert_recovered"``, etc.
-            status: Event status (0=new, 1=validated, 2=in progress).
-            limit: If > 0, return only first N events.
-
-        Returns:
-            List of event dicts with keys: ``id_evento``, ``id_agente``,
-            ``agent_name``, ``id_grupo``, ``group_name``, ``criticity``,
-            ``criticity_name``, ``event_type``, ``timestamp``, ``utimestamp``,
-            ``evento`` (description), ``estado``, ``module_name``,
-            ``id_agentmodule``, etc.
-        """
-        # Pandora returns max ~40 events per call without pagination.
-        events = await self._call("events")
-        if not isinstance(events, list):
-            if isinstance(events, dict) and "data" in events:
-                events = events["data"]
-            else:
-                events = []
-
-        # Client-side filters
-        ts_start = _to_unix(date_start, end_of_day=False) if date_start else None
-        ts_end = _to_unix(date_end, end_of_day=True) if date_end else None
-
-        filtered: list[dict] = []
-        for evt in events:
-            if not isinstance(evt, dict):
-                continue
-
-            # Group filter
-            if id_group is not None:
-                try:
-                    evt_group = int(evt.get("id_grupo") or 0)
-                except (ValueError, TypeError):
-                    continue
-                if evt_group != int(id_group):
-                    continue
-
-            # Date filter
-            uts_str = evt.get("utimestamp")
-            if ts_start is not None or ts_end is not None:
-                if uts_str is None:
-                    continue
-                try:
-                    uts = int(uts_str)
-                except (ValueError, TypeError):
-                    continue
-                if ts_start is not None and uts < ts_start:
-                    continue
-                if ts_end is not None and uts > ts_end:
-                    continue
-
-            # Severity filter
-            if criticity is not None:
-                try:
-                    evt_crit = int(evt.get("criticity") or 0)
-                except (ValueError, TypeError):
-                    continue
-                if evt_crit != int(criticity):
-                    continue
-
-            # Event type filter
-            if event_type and evt.get("event_type") != event_type:
-                continue
-
-            # Status filter
-            if status is not None:
-                try:
-                    evt_status = int(evt.get("estado") or 0)
-                except (ValueError, TypeError):
-                    continue
-                if evt_status != int(status):
-                    continue
-
-            filtered.append(evt)
-
-        if limit and limit > 0:
-            return filtered[:limit]
-        return filtered
-
-    # -- 3.6  Agent modules (events-based discovery) -----------------
-
-    async def discover_agent_modules(
-        self, agent_id: int,
-    ) -> list[dict]:
-        """Discover metric modules + data for an agent via events scan.
-
-        Pandora Community Ed has NO per-agent module API (tested
-        exhaustively: agent_modules, AJAX, all return global data).
-        We rely on event-based module discovery — scanning module IDs
-        that appear in events for this agent.
-
-        For agents with no events: no module IDs available → empty result.
-        """
-        # Cache events (fetched once per client instance for all agents)
-        if not hasattr(self, "_cached_events"):
-            raw = await self._call("events")
-            if isinstance(raw, dict) and "data" in raw:
-                raw = raw["data"]
-            self._cached_events = raw if isinstance(raw, list) else []
-
-        known: set[int] = set()
-        for evt in self._cached_events:
-            if not isinstance(evt, dict):
-                continue
-            try:
-                aid = int(evt.get("id_agente") or 0)
-                mid = int(evt.get("id_agentmodule") or 0)
-            except (ValueError, TypeError):
-                continue
-            if aid == int(agent_id) and mid:
-                known.add(mid)
-
-        if not known:
+        if not rows:
             return []
 
-        center = min(known)
-        found: list[dict] = []
-        for mid in range(max(1, center - 15), center + 15):
+        # Filter to metric modules only (CPU/Memory/Disk by name)
+        ok_kw = ["cpu", "processor", "load", "iowait", "mem", "memory", "ram", "swap", "disk", "storage"]
+        skip_kw = ["host alive", "host latency", "latency", "icmp", "ping",
+                   "ifadminstatus", "ifoperstatus", "traffic", "ifinoctets",
+                   "ifoutoctets", "ifdescr", "service", "status", "process",
+                   "tcp", "udp", "snmp", "temp_mount", "snap/", "check port"]
+
+        relevant = []
+        for r in rows:
+            name = (r.get("nombre") or "").lower()
+            if any(kw in name for kw in skip_kw):
+                continue
+            if any(kw in name for kw in ok_kw):
+                relevant.append(r)
+
+        logger.info("Agent %d: %d modules from DB (%d metric)", agent_id, len(rows), len(relevant))
+
+        # Fetch data for each relevant module (max 10)
+        found = []
+        for mod in relevant[:10]:
+            mid = mod.get("id_agente_modulo")
+            if not mid:
+                continue
             try:
-                raw = await self._raw_module_data(mid)
+                raw = await self._raw_module_data(int(mid))
             except PandoraAPIError:
                 continue
             if not raw:
@@ -683,14 +499,75 @@ class PandoraClient:
             points = _parse_module_data_tokens(raw)
             if points:
                 found.append({
-                    "module_id": mid,
-                    "module_name": f"Module {mid}",
+                    "module_id": int(mid),
+                    "module_name": mod.get("nombre", f"Module {mid}"),
                     "data_points": points,
                     "count": len(points),
                     "avg": sum(p["value"] for p in points) / len(points),
                     "max_val": max(p["value"] for p in points),
                 })
+        return sorted(found, key=lambda m: m["module_id"])
 
+    async def get_module_data(self, module_id: int, date_start: str, date_end: str) -> list[dict]:
+        """Return historical data points for a single module."""
+        result = await self._call("module_data", id_=str(module_id))
+        if isinstance(result, list): data = result
+        elif isinstance(result, dict) and "data" in result: data = result["data"]
+        else: data = []
+        if data and date_start and date_end:
+            ts_s = _to_unix(date_start, end_of_day=False)
+            ts_e = _to_unix(date_end, end_of_day=True)
+            data = [d for d in data if isinstance(d,dict) and ts_s <= int(d.get("utimestamp",0)) <= ts_e]
+        return data
+
+    async def get_events(self, id_group=None, date_start=None, date_end=None,
+                         criticity=None, event_type=None, status=None, limit=0) -> list[dict]:
+        """Return events, filtered client-side."""
+        events = await self._call("events")
+        if isinstance(events, dict) and "data" in events: events = events["data"]
+        if not isinstance(events, list): events = []
+        ts_s = _to_unix(date_start) if date_start else None
+        ts_e = _to_unix(date_end, end_of_day=True) if date_end else None
+        filtered = []
+        for evt in events:
+            if not isinstance(evt, dict): continue
+            if id_group is not None and int(evt.get("id_grupo",0)) != int(id_group): continue
+            if ts_s is not None or ts_e is not None:
+                uts = int(evt.get("utimestamp",0))
+                if ts_s and uts < ts_s: continue
+                if ts_e and uts > ts_e: continue
+            if criticity is not None and int(evt.get("criticity",0)) != int(criticity): continue
+            if event_type and evt.get("event_type") != event_type: continue
+            if status is not None and int(evt.get("estado",0)) != int(status): continue
+            filtered.append(evt)
+        return filtered[:limit] if limit and limit > 0 else filtered
+
+    async def _discover_via_events(self, agent_id: int) -> list[dict]:
+        """Fallback: find modules via events + sequential scan."""
+        if not hasattr(self, "_cached_events"):
+            raw = await self._call("events")
+            if isinstance(raw, dict) and "data" in raw: raw = raw["data"]
+            self._cached_events = raw if isinstance(raw, list) else []
+        known = set()
+        for evt in self._cached_events:
+            if not isinstance(evt, dict): continue
+            try:
+                if int(evt.get("id_agente",0)) == int(agent_id):
+                    known.add(int(evt.get("id_agentmodule",0)))
+            except (ValueError, TypeError): pass
+        if not known: return []
+        center = min(known)
+        found = []
+        for mid in range(max(1, center - 15), center + 15):
+            try: raw = await self._raw_module_data(mid)
+            except PandoraAPIError: continue
+            if not raw: continue
+            points = _parse_module_data_tokens(raw)
+            if points:
+                found.append({"module_id":mid,"module_name":f"Module {mid}",
+                    "data_points":points,"count":len(points),
+                    "avg":sum(p["value"] for p in points)/len(points),
+                    "max_val":max(p["value"] for p in points)})
         return sorted(found, key=lambda m: m["module_id"])
 
     async def _raw_module_data(self, module_id: int) -> str:
