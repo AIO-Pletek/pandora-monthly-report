@@ -467,19 +467,28 @@ class PandoraClient:
         if not rows:
             return []
 
-        # Filter to metric modules only (CPU/Memory/Disk by name)
-        ok_kw = ["cpu", "processor", "load", "iowait", "mem", "memory", "ram", "swap", "disk", "storage"]
+        # Filter to metric modules only by name.
+        # CPU: only "CPU Load" / "CPU Usage" — skip IOWait, Load Average, etc.
+        # Memory/Disk: broad matching.
+        cpu_ok = ["cpu load", "cpu usage", "cpu utilization"]
+        mem_ok = ["mem", "memory", "ram", "swap"]
+        disk_ok = ["disk", "storage"]
         skip_kw = ["host alive", "host latency", "latency", "icmp", "ping",
                    "ifadminstatus", "ifoperstatus", "traffic", "ifinoctets",
                    "ifoutoctets", "ifdescr", "service", "status", "process",
-                   "tcp", "udp", "snmp", "temp_mount", "snap/", "check port"]
+                   "tcp", "udp", "snmp", "temp_mount", "snap/", "check port",
+                   "load average", "iowait", "processor"]
 
         relevant = []
         for r in rows:
             name = (r.get("nombre") or "").lower()
             if any(kw in name for kw in skip_kw):
                 continue
-            if any(kw in name for kw in ok_kw):
+            match = False
+            if any(kw in name for kw in cpu_ok): match = True
+            elif any(kw in name for kw in mem_ok): match = True
+            elif any(kw in name for kw in disk_ok): match = True
+            if match:
                 relevant.append(r)
 
         logger.info("Agent %d: %d modules from DB (%d metric)", agent_id, len(rows), len(relevant))

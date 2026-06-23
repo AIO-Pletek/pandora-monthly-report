@@ -46,7 +46,7 @@ COLOR_DISK = "#DC3545"
 FONT_FAMILY = "DejaVu Sans"
 
 # Keywords for classifying modules by name (case-insensitive)
-_CPU_NAMES = {"cpu", "processor", "proc", "load", "iowait", "io_wait", "io wait"}
+_CPU_NAMES = {"cpu load", "cpu usage", "cpu utilization", "cpu user", "cpu system"}
 _MEM_NAMES = {"mem", "memory", "ram", "swap"}
 _DISK_NAMES = {"disk", "storage", "drive", "volume", "c:", "d:", "e:", "f:", "/", "hdd", "ssd"}
 # Skip these non-metric modules
