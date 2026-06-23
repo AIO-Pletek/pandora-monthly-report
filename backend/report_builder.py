@@ -56,6 +56,7 @@ _SKIP_NAMES = {
     "uptime", "connection", "error", "event", "alert", "unknown",
     "traffic", "packet", "interface", "port", "agent",
     "sensor", "temperature", "humidity", "power",
+    "load average", "iowait", "io wait",
 }
 
 
