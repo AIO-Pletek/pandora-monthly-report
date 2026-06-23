@@ -492,7 +492,7 @@ class PandoraClient:
                 continue
             try:
                 raw = await self._raw_module_data(int(mid))
-            except PandoraAPIError:
+            except (PandoraAPIError, Exception):
                 continue
             if not raw:
                 continue
@@ -588,10 +588,13 @@ class PandoraClient:
             "return_type": "json",
             "id": str(module_id),
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(self.base_url, params=params)
-            resp.raise_for_status()
-        text = resp.text.strip()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(self.base_url, params=params)
+                resp.raise_for_status()
+            text = resp.text.strip()
+        except Exception:
+            return ""
 
         # Unwrap JSON-wrapped responses: {"type":"string","data":"No data..."}
         if text.startswith("{"):
