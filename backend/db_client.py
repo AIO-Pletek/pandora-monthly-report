@@ -105,7 +105,7 @@ class PandoraDB:
         return self.query("""
             SELECT
                 a.id_agente,
-                a.nombre AS alias,
+                a.alias,
                 a.direccion,
                 a.comentarios,
                 a.id_grupo,
