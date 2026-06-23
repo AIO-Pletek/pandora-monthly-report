@@ -468,15 +468,23 @@ class PandoraClient:
             return []
 
         # Filter to metric modules only by name.
-        # CPU: only "CPU Load" / "CPU Usage" — skip IOWait, Load Average, etc.
-        # Memory/Disk: broad matching.
         cpu_ok = ["cpu load", "cpu usage", "cpu utilization"]
         mem_ok = ["mem", "memory", "ram"]
-        disk_ok = ["disk", "storage"]
+        # Disk: only essential mounts (/, /var, /data, /home) + Windows drives
+        disk_prefixes = ["disk", "storage"]
+        allowed_disks = ["/ ", " /", "disk_/ ", "disk_/\"",  # root disk
+                        "/var", "/data", "/home",  # Linux essential
+                        "/data-nfs", "/var/www", "/opt",  # Linux extra
+                        "c:", "d:", "e:", "f:"]  # Windows
+        skip_disk_kw = ["/boot", "/tmp", "/mnt", "/snap", "/owncloud",
+                       "/backup", "/pgsql", "/apps",
+                       "/var/lib", "/nimble",
+                       "temp_mount", ".temp_mount", "temp mount",
+                       "freedisk", "spool"]
         skip_kw = ["host alive", "host latency", "latency", "icmp", "ping",
                    "ifadminstatus", "ifoperstatus", "traffic", "ifinoctets",
                    "ifoutoctets", "ifdescr", "service", "status", "process",
-                   "tcp", "udp", "snmp", "temp_mount", "snap/", "check port",
+                   "tcp", "udp", "snmp", "check port",
                    "load average", "iowait", "processor",
                    "swap", "swap_used", "swap used"]
 
@@ -486,9 +494,16 @@ class PandoraClient:
             if any(kw in name for kw in skip_kw):
                 continue
             match = False
-            if any(kw in name for kw in cpu_ok): match = True
-            elif any(kw in name for kw in mem_ok): match = True
-            elif any(kw in name for kw in disk_ok): match = True
+            if any(kw in name for kw in cpu_ok):
+                match = True
+            elif any(kw in name for kw in mem_ok):
+                match = True
+            elif any(kw in name for kw in disk_prefixes):
+                # Disk: only keep if path matches allowed list
+                if any(kw in name for kw in skip_disk_kw):
+                    continue
+                if any(ok in name for ok in allowed_disks):
+                    match = True
             if match:
                 relevant.append(r)
 
