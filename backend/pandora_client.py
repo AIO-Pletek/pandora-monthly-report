@@ -471,13 +471,14 @@ class PandoraClient:
         # CPU: only "CPU Load" / "CPU Usage" — skip IOWait, Load Average, etc.
         # Memory/Disk: broad matching.
         cpu_ok = ["cpu load", "cpu usage", "cpu utilization"]
-        mem_ok = ["mem", "memory", "ram", "swap"]
+        mem_ok = ["mem", "memory", "ram"]
         disk_ok = ["disk", "storage"]
         skip_kw = ["host alive", "host latency", "latency", "icmp", "ping",
                    "ifadminstatus", "ifoperstatus", "traffic", "ifinoctets",
                    "ifoutoctets", "ifdescr", "service", "status", "process",
                    "tcp", "udp", "snmp", "temp_mount", "snap/", "check port",
-                   "load average", "iowait", "processor"]
+                   "load average", "iowait", "processor",
+                   "swap", "swap_used", "swap used"]
 
         relevant = []
         for r in rows:

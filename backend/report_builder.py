@@ -47,7 +47,7 @@ FONT_FAMILY = "DejaVu Sans"
 
 # Keywords for classifying modules by name (case-insensitive)
 _CPU_NAMES = {"cpu load", "cpu usage", "cpu utilization", "cpu user", "cpu system"}
-_MEM_NAMES = {"mem", "memory", "ram", "swap"}
+_MEM_NAMES = {"mem", "memory", "ram"}
 _DISK_NAMES = {"disk", "storage", "drive", "volume", "c:", "d:", "e:", "f:", "/", "hdd", "ssd"}
 # Skip these non-metric modules
 _SKIP_NAMES = {
@@ -57,6 +57,7 @@ _SKIP_NAMES = {
     "traffic", "packet", "interface", "port", "agent",
     "sensor", "temperature", "humidity", "power",
     "load average", "iowait", "io wait",
+    "swap", "swap used",
 }
 
 
