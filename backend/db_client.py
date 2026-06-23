@@ -87,9 +87,12 @@ class PandoraDB:
 
     def get_groups(self) -> list[dict]:
         """Return all agent groups: id_grupo, nombre, icon, etc."""
-        return self.query(
+        rows = self.query(
             "SELECT id_grupo, nombre FROM tgrupo ORDER BY nombre"
         )
+        for r in rows:
+            r["nombre"] = html.unescape(r.get("nombre") or "")
+        return rows
 
     def get_agent_count_by_group(self, id_grupo: int) -> int:
         """Return how many agents are in a group."""
@@ -122,6 +125,7 @@ class PandoraDB:
         for r in rows:
             r["alias"] = html.unescape(r.get("alias") or "")
             r["comentarios"] = html.unescape(r.get("comentarios") or "")
+            r["grupo_nombre"] = html.unescape(r.get("grupo_nombre") or "")
         return rows
 
     def get_agents_by_group(self, id_grupo: int) -> list[dict]:

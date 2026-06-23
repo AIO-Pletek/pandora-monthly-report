@@ -35,9 +35,9 @@ from docx.shared import Inches, Pt, RGBColor  # noqa: E402
 logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────
-CHART_DPI = 130
-CHART_W_INCHES = 5.5
-CHART_H_INCHES = 2.2
+CHART_DPI = 120
+CHART_W_INCHES = 4.8
+CHART_H_INCHES = 1.9
 
 COLOR_CPU = "#0D6EFD"
 COLOR_MEM = "#198754"
