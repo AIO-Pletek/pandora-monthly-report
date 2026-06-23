@@ -475,9 +475,10 @@ class PandoraClient:
         allowed_disks = ["/ ", " /", "disk_/ ", "disk_/\"",  # root disk
                         "/var", "/data", "/home",  # Linux essential
                         "/data-nfs", "/var/www", "/opt",  # Linux extra
+                        "/owncloud_data", "/apps",  # app-specific
                         "c:", "d:", "e:", "f:"]  # Windows
-        skip_disk_kw = ["/boot", "/tmp", "/mnt", "/snap", "/owncloud",
-                       "/backup", "/pgsql", "/apps",
+        skip_disk_kw = ["/boot", "/tmp", "/mnt", "/snap",
+                       "/backup", "/pgsql",
                        "/var/lib", "/nimble",
                        "temp_mount", ".temp_mount", "temp mount",
                        "freedisk", "spool"]
