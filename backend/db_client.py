@@ -13,6 +13,7 @@ Database connection is lazy — only created on first use.
 
 from __future__ import annotations
 
+import html
 import logging
 from contextlib import contextmanager
 from typing import Any
@@ -102,7 +103,7 @@ class PandoraDB:
 
     def get_agents(self) -> list[dict]:
         """Return ALL agents with group info."""
-        return self.query("""
+        rows = self.query("""
             SELECT
                 a.id_agente,
                 a.alias,
@@ -116,27 +117,35 @@ class PandoraDB:
             FROM tagente a
             LEFT JOIN tgrupo g ON a.id_grupo = g.id_grupo
             WHERE a.disabled = 0
-            ORDER BY a.nombre
+            ORDER BY a.alias
         """)
+        for r in rows:
+            r["alias"] = html.unescape(r.get("alias") or "")
+            r["comentarios"] = html.unescape(r.get("comentarios") or "")
+        return rows
 
     def get_agents_by_group(self, id_grupo: int) -> list[dict]:
         """Return agents in a specific group."""
-        return self.query(
+        rows = self.query(
             """
-            SELECT id_agente, nombre AS alias, direccion, comentarios,
+            SELECT id_agente, alias, direccion, comentarios,
                    id_grupo, id_os, ultimo_contacto, intervalo
             FROM tagente
             WHERE id_grupo = %s AND disabled = 0
-            ORDER BY nombre
+            ORDER BY alias
             """,
             (id_grupo,),
         )
+        for r in rows:
+            r["alias"] = html.unescape(r.get("alias") or "")
+            r["comentarios"] = html.unescape(r.get("comentarios") or "")
+        return rows
 
     # ── Module queries ──────────────────────────────────────────────────
 
     def get_agent_modules(self, agent_id: int) -> list[dict]:
         """Return all modules for an agent: module ID + name."""
-        return self.query(
+        rows = self.query(
             """
             SELECT id_agente_modulo, nombre, descripcion, id_tipo_modulo
             FROM tagente_modulo
@@ -145,3 +154,6 @@ class PandoraDB:
             """,
             (agent_id,),
         )
+        for r in rows:
+            r["nombre"] = html.unescape(r.get("nombre") or "")
+        return rows
