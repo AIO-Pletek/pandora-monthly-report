@@ -472,8 +472,7 @@ class PandoraClient:
         mem_ok = ["mem", "memory", "ram"]
         # Disk: only essential mounts (/, /var, /data, /home) + Windows drives
         disk_prefixes = ["disk", "storage"]
-        allowed_disks = ["/ ", " /", "disk_/ ", "disk_/\"",  # root disk
-                        "/var", "/data", "/home",  # Linux essential
+        allowed_disks = ["/var", "/data", "/home",  # Linux essential
                         "/data-nfs", "/var/www", "/opt",  # Linux extra
                         "/owncloud_data", "/apps",  # app-specific
                         "c:", "d:", "e:", "f:"]  # Windows
@@ -500,10 +499,12 @@ class PandoraClient:
             elif any(kw in name for kw in mem_ok):
                 match = True
             elif any(kw in name for kw in disk_prefixes):
-                # Disk: only keep if path matches allowed list
+                # Disk: only keep essential mounts
                 if any(kw in name for kw in skip_disk_kw):
                     continue
-                if any(ok in name for ok in allowed_disks):
+                # Root disk: name ends with "_/" or " /" and no other path
+                is_root = name.endswith("_/") or name.endswith(" /")
+                if is_root or any(ok in name for ok in allowed_disks):
                     match = True
             if match:
                 relevant.append(r)
