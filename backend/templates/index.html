@@ -239,7 +239,13 @@
                     }),
                 });
 
-                const data = await resp.json();
+                let data;
+                try {
+                    data = await resp.json();
+                } catch (e) {
+                    showStatus('Server timeout — too many agents. Try a smaller group or wait and retry.', 'error');
+                    return;
+                }
 
                 if (resp.ok && data.status === 'completed') {
                     showStatus('Report generated successfully!', 'success');
