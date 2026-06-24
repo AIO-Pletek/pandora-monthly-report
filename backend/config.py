@@ -27,6 +27,10 @@ PANDORA_API_PASSWORD: str = os.getenv("PANDORA_API_PASSWORD", "")
 APP_ENV: str = os.getenv("APP_ENV", "development")
 APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
 
+# ── Login ────────────────────────────────────────────────────────
+LOGIN_USERNAME: str = os.getenv("LOGIN_USERNAME", "admin")
+LOGIN_PASSWORD: str = os.getenv("LOGIN_PASSWORD", "change_me")
+
 # ── Pandora Database (MySQL, read-only) ──────────────────────────
 PANDORA_DB_HOST: str = os.getenv("PANDORA_DB_HOST", "localhost")
 PANDORA_DB_PORT: int = int(os.getenv("PANDORA_DB_PORT", "3306"))

@@ -30,6 +30,8 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from config import (
     APP_ENV,
     APP_PORT,
+    LOGIN_PASSWORD,
+    LOGIN_USERNAME,
     OUTPUT_DIR,
     PANDORA_API_PASSWORD,
     PANDORA_API_USER,
@@ -67,8 +69,8 @@ def _render_template(name: str, **ctx) -> HTMLResponse:
 
 
 # ── Auth ────────────────────────────────────────────────────────────────────
-AUTH_USER = PANDORA_API_USER  # reuse API user for login
-AUTH_PASS = PANDORA_API_USER_PASS  # reuse API password for login
+AUTH_USER = LOGIN_USERNAME
+AUTH_PASS = LOGIN_PASSWORD
 _active_tokens: dict[str, float] = {}  # token → expiry timestamp
 TOKEN_TTL = 86400  # 24 hours
 
