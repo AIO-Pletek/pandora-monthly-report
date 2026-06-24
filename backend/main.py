@@ -135,13 +135,19 @@ async def login_page():
 
 @app.post("/api/login")
 async def login_api(data: dict):
-    """Validate credentials and return a session token."""
+    """Validate credentials, set auth cookie, return token."""
     username = data.get("username", "")
     password = data.get("password", "")
     if username == AUTH_USER and password == AUTH_PASS:
         token = secrets.token_hex(32)
         _active_tokens[token] = time.time() + TOKEN_TTL
-        return {"token": token, "ok": True}
+        from fastapi.responses import JSONResponse
+        resp = JSONResponse({"token": token, "ok": True})
+        resp.set_cookie(
+            key="token", value=token, max_age=TOKEN_TTL,
+            httponly=True, samesite="lax",
+        )
+        return resp
     raise HTTPException(status_code=401, detail="Invalid credentials. The abyss rejects you.")
 
 
