@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pandora Monthly Report</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Metal+Mania&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --void: #070707;
+            --abyss: #0d0505;
+            --blood: #8B0000;
+            --blood-bright: #cc1111;
+            --bone: #9e9e9e;
+            --silver: #c8c8c8;
+            --ash: #3a3a3a;
+            --eye-glow: #f0e6d3;
+        }
+
+        body {
+            background: var(--void);
+            color: var(--silver);
+            font-family: 'Rajdhani', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        /* Ambient fog / texture overlay */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background:
+                radial-gradient(ellipse at 50% 30%, rgba(139,0,0,0.06) 0%, transparent 70%),
+                radial-gradient(ellipse at 20% 80%, rgba(139,0,0,0.04) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, rgba(139,0,0,0.04) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* Noise texture */
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            opacity: 0.03;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2rem;
+        }
+
+        /* ── Character ─────────────────────────────────────────── */
+        .character {
+            position: relative;
+            width: 160px;
+            height: 200px;
+        }
+
+        /* Head */
+        .head {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100px;
+            height: 110px;
+            background: var(--abyss);
+            border: 2px solid var(--ash);
+            border-radius: 50% 50% 45% 45%;
+            z-index: 3;
+            transition: border-color 0.4s;
+        }
+
+        /* Eyes — two states */
+        .eyes {
+            position: absolute;
+            top: 55px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 18px;
+            z-index: 4;
+        }
+
+        .eye {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--eye-glow);
+            transition: all 0.25s ease;
+            box-shadow: 0 0 6px rgba(240,230,211,0.5);
+        }
+
+        .password-active .eye {
+            height: 3px;
+            border-radius: 2px;
+            margin-top: 6px;
+            background: var(--blood-bright);
+            box-shadow: 0 0 8px rgba(204,17,17,0.6);
+        }
+
+        /* Mouth */
+        .mouth {
+            position: absolute;
+            bottom: 28px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 30px;
+            height: 0;
+            border-bottom: 2px solid var(--ash);
+            border-radius: 0 0 10px 10px;
+            z-index: 4;
+            transition: all 0.4s;
+        }
+
+        .username-active .mouth {
+            width: 22px;
+            height: 10px;
+            border-radius: 50%;
+            border: 2px solid var(--blood);
+            border-top: none;
+            background: rgba(139,0,0,0.15);
+        }
+
+        /* Coronet / crown spikes */
+        .spikes {
+            position: absolute;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 6px;
+            z-index: 2;
+        }
+        .spike {
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-bottom: 12px solid var(--ash);
+            transition: border-bottom-color 0.4s;
+        }
+        .spike:nth-child(1) { border-bottom-width: 10px; }
+        .spike:nth-child(3) { border-bottom-width: 14px; }
+        .spike:nth-child(5) { border-bottom-width: 10px; }
+
+        .password-active .spike { border-bottom-color: var(--blood); }
+
+        /* Arms */
+        .arm {
+            position: absolute;
+            top: 50px;
+            width: 8px;
+            background: var(--ash);
+            border-radius: 4px;
+            z-index: 1;
+            transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+            transform-origin: bottom center;
+        }
+
+        .arm-left {
+            left: 15px;
+            height: 50px;
+            transform: rotate(25deg);
+        }
+
+        .arm-right {
+            right: 15px;
+            height: 50px;
+            transform: rotate(-25deg);
+        }
+
+        /* Hands / horns */
+        .hand {
+            position: absolute;
+            top: -14px;
+            width: 0;
+            height: 0;
+        }
+
+        .hand::before, .hand::after {
+            content: '';
+            position: absolute;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-bottom: 10px solid var(--ash);
+            transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        .arm-left .hand { left: -6px; }
+        .arm-left .hand::before { left: -8px; top: 0; transform: rotate(-20deg); }
+        .arm-left .hand::after  { left: 2px; top: 0; transform: rotate(20deg); }
+
+        .arm-right .hand { left: -6px; }
+        .arm-right .hand::before { left: -8px; top: 0; transform: rotate(-20deg); }
+        .arm-right .hand::after  { left: 2px; top: 0; transform: rotate(20deg); }
+
+        /* Arms raised state */
+        .username-active .arm-left {
+            transform: rotate(-55deg);
+            height: 65px;
+        }
+        .username-active .arm-right {
+            transform: rotate(55deg);
+            height: 65px;
+        }
+        .username-active .arm-left .hand::before,
+        .username-active .arm-left .hand::after,
+        .username-active .arm-right .hand::before,
+        .username-active .arm-right .hand::after {
+            border-bottom-color: var(--blood-bright);
+        }
+        .username-active .arm-left,
+        .username-active .arm-right {
+            background: var(--blood-bright);
+        }
+
+        /* Desk / ground */
+        .desk {
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 180px;
+            height: 3px;
+            background: linear-gradient(90deg, transparent, var(--ash), transparent);
+            opacity: 0.4;
+            z-index: 0;
+        }
+
+        /* ── Pentagram glow when both fields active ────────────── */
+        .both-active .head {
+            border-color: var(--blood-bright);
+            box-shadow: 0 0 25px rgba(204,17,17,0.2);
+        }
+        .both-active .eye {
+            background: var(--blood-bright);
+            box-shadow: 0 0 12px rgba(204,17,17,0.7);
+        }
+
+        /* ── Form ────────────────────────────────────────────── */
+        .login-card {
+            width: 360px;
+            max-width: 90vw;
+            padding: 2.5rem 2rem;
+            background: rgba(13,5,5,0.85);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--ash);
+            position: relative;
+        }
+
+        /* Ornamental border corners */
+        .login-card::before,
+        .login-card::after {
+            content: '✠';
+            position: absolute;
+            color: var(--blood);
+            font-size: 0.65rem;
+            opacity: 0.5;
+        }
+        .login-card::before { top: 6px; left: 10px; }
+        .login-card::after  { bottom: 6px; right: 10px; transform: rotate(180deg); }
+
+        .login-card h1 {
+            font-family: 'Metal Mania', cursive;
+            font-size: 1.6rem;
+            color: var(--silver);
+            text-align: center;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.15rem;
+        }
+
+        .login-card .subtitle {
+            text-align: center;
+            font-size: 0.65rem;
+            letter-spacing: 0.3em;
+            color: var(--blood);
+            text-transform: uppercase;
+            margin-bottom: 2rem;
+        }
+
+        .field {
+            margin-bottom: 1.25rem;
+            position: relative;
+        }
+
+        .field label {
+            display: block;
+            font-size: 0.7rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--bone);
+            margin-bottom: 0.35rem;
+        }
+
+        .field input {
+            width: 100%;
+            padding: 0.7rem 0.85rem;
+            background: var(--void);
+            border: 1px solid var(--ash);
+            color: var(--silver);
+            font-family: 'Rajdhani', sans-serif;
+            font-size: 1rem;
+            letter-spacing: 0.05em;
+            transition: all 0.25s;
+            outline: none;
+        }
+
+        .field input:focus {
+            border-color: var(--blood-bright);
+            box-shadow: 0 0 10px rgba(204,17,17,0.15);
+        }
+
+        .field input::placeholder {
+            color: #444;
+            letter-spacing: 0.05em;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 0.75rem;
+            background: transparent;
+            color: var(--silver);
+            border: 1px solid var(--blood);
+            font-family: 'Metal Mania', cursive;
+            font-size: 1rem;
+            letter-spacing: 0.2em;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 0.5rem;
+            text-transform: uppercase;
+        }
+
+        .btn:hover {
+            background: var(--blood);
+            color: #fff;
+            box-shadow: 0 0 20px rgba(139,0,0,0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .error-msg {
+            text-align: center;
+            color: var(--blood-bright);
+            font-size: 0.8rem;
+            min-height: 1.2rem;
+            margin-top: 0.5rem;
+            letter-spacing: 0.05em;
+        }
+
+        /* Desktop */
+        @media (min-width: 640px) {
+            .container {
+                flex-direction: row;
+                gap: 3rem;
+            }
+            .character {
+                width: 180px;
+                height: 220px;
+            }
+            .login-card {
+                width: 340px;
+            }
+        }
+
+        /* Reduced motion */
+        @media (prefers-reduced-motion: reduce) {
+            .arm, .eye, .mouth, .head, .hand::before, .hand::after, .spike {
+                transition: none !important;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container" id="container">
+    <!-- Character -->
+    <div class="character" id="character">
+        <div class="spikes">
+            <div class="spike"></div><div class="spike"></div><div class="spike"></div>
+            <div class="spike"></div><div class="spike"></div>
+        </div>
+        <div class="head"></div>
+        <div class="eyes">
+            <div class="eye"></div>
+            <div class="eye"></div>
+        </div>
+        <div class="mouth"></div>
+        <div class="arm arm-left"><div class="hand"></div></div>
+        <div class="arm arm-right"><div class="hand"></div></div>
+        <div class="desk"></div>
+    </div>
+
+    <!-- Login form -->
+    <div class="login-card">
+        <h1>PANDORA</h1>
+        <p class="subtitle">Monthly Report</p>
+
+        <form id="loginForm">
+            <div class="field">
+                <label for="username">Username</label>
+                <input type="text" id="username" placeholder="Enter your name" autocomplete="off" required>
+            </div>
+            <div class="field">
+                <label for="password">Password</label>
+                <input type="password" id="password" placeholder="••••••••" required>
+            </div>
+            <button type="submit" class="btn" id="loginBtn">Enter the Abyss</button>
+            <div class="error-msg" id="errorMsg"></div>
+        </form>
+    </div>
+</div>
+
+<script>
+    const container = document.getElementById('character');
+    const userInput = document.getElementById('username');
+    const passInput = document.getElementById('password');
+    const loginForm = document.getElementById('loginForm');
+    const errorMsg = document.getElementById('errorMsg');
+    const loginBtn = document.getElementById('loginBtn');
+
+    // Character state classes
+    userInput.addEventListener('focus', () => container.classList.add('username-active'));
+    userInput.addEventListener('blur', () => {
+        if (!userInput.value) container.classList.remove('username-active');
+    });
+    userInput.addEventListener('input', () => {
+        if (userInput.value) container.classList.add('username-active');
+        else container.classList.remove('username-active');
+    });
+
+    passInput.addEventListener('focus', () => container.classList.add('password-active'));
+    passInput.addEventListener('blur', () => {
+        if (!passInput.value) container.classList.remove('password-active');
+    });
+    passInput.addEventListener('input', () => {
+        if (passInput.value) container.classList.add('password-active');
+        else container.classList.remove('password-active');
+    });
+
+    // Both active
+    function updateBoth() {
+        if (userInput.value && passInput.value) {
+            container.classList.add('both-active');
+        } else {
+            container.classList.remove('both-active');
+        }
+    }
+    userInput.addEventListener('input', updateBoth);
+    passInput.addEventListener('input', updateBoth);
+
+    // Login
+    loginForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        loginBtn.disabled = true;
+        loginBtn.textContent = '...';
+        errorMsg.textContent = '';
+
+        try {
+            const resp = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username: userInput.value,
+                    password: passInput.value,
+                }),
+            });
+
+            if (resp.ok) {
+                const data = await resp.json();
+                // Store token and redirect
+                sessionStorage.setItem('auth_token', data.token);
+                window.location.href = '/app';
+            } else {
+                const data = await resp.json().catch(() => ({ detail: 'Login failed' }));
+                errorMsg.textContent = data.detail || 'Invalid credentials';
+                container.classList.remove('username-active', 'password-active', 'both-active');
+            }
+        } catch (e) {
+            errorMsg.textContent = 'Connection failed. Try again.';
+        } finally {
+            loginBtn.disabled = false;
+            loginBtn.textContent = 'Enter the Abyss';
+        }
+    });
+</script>
+</body>
+</html>

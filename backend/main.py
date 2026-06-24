@@ -16,12 +16,16 @@ Run:
 from __future__ import annotations
 
 import calendar
+import hashlib
 import logging
+import secrets
+import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Cookie, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from config import (
     APP_ENV,
@@ -62,6 +66,26 @@ def _render_template(name: str, **ctx) -> HTMLResponse:
     return HTMLResponse(template.render(**ctx))
 
 
+# ── Auth ────────────────────────────────────────────────────────────────────
+AUTH_USER = PANDORA_API_USER  # reuse API user for login
+AUTH_PASS = PANDORA_API_USER_PASS  # reuse API password for login
+_active_tokens: dict[str, float] = {}  # token → expiry timestamp
+TOKEN_TTL = 86400  # 24 hours
+
+
+def _check_auth(token: Optional[str] = Cookie(None)) -> bool:
+    """Validate session token from cookie."""
+    if not token or token not in _active_tokens:
+        return False
+    if time.time() > _active_tokens[token]:
+        del _active_tokens[token]
+        return False
+    return True
+
+
+# ── Client factory ───────────────────────────────────────────────────────────
+
+
 # ── Client factory ─────────────────────────────────────────────────────────
 
 def _get_client() -> PandoraClient:
@@ -95,9 +119,35 @@ def _get_client() -> PandoraClient:
 
 # ── Routes: UI ─────────────────────────────────────────────────────────────
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    """Main page — group selection + month picker form."""
+@app.get("/")
+async def root():
+    """Redirect to login."""
+    return RedirectResponse("/login")
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    """Login page with black metal theme."""
+    return _render_template("login.html")
+
+
+@app.post("/api/login")
+async def login_api(data: dict):
+    """Validate credentials and return a session token."""
+    username = data.get("username", "")
+    password = data.get("password", "")
+    if username == AUTH_USER and password == AUTH_PASS:
+        token = secrets.token_hex(32)
+        _active_tokens[token] = time.time() + TOKEN_TTL
+        return {"token": token, "ok": True}
+    raise HTTPException(status_code=401, detail="Invalid credentials. The abyss rejects you.")
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def app_index(token: Optional[str] = Cookie(None)):
+    """Main page — group selection + date picker form. Requires login."""
+    if not _check_auth(token):
+        return RedirectResponse("/login")
     now = datetime.now()
     months = [
         (1, "January"), (2, "February"), (3, "March"), (4, "April"),
