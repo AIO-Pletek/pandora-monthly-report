@@ -72,7 +72,7 @@ def _render_template(name: str, **ctx) -> HTMLResponse:
 AUTH_USER = LOGIN_USERNAME
 AUTH_PASS = LOGIN_PASSWORD
 _active_tokens: dict[str, float] = {}  # token → expiry timestamp
-TOKEN_TTL = 86400  # 24 hours
+TOKEN_TTL = 7200  # 2 hours
 
 
 def _check_auth(token: Optional[str] = Cookie(None)) -> bool:
@@ -149,6 +149,14 @@ async def login_api(data: dict):
         )
         return resp
     raise HTTPException(status_code=401, detail="Invalid credentials. The abyss rejects you.")
+
+
+@app.get("/logout")
+async def logout():
+    """Clear session and redirect to login."""
+    resp = RedirectResponse("/login")
+    resp.delete_cookie("token")
+    return resp
 
 
 @app.get("/app", response_class=HTMLResponse)
