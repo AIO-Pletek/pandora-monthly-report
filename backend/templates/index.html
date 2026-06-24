@@ -127,10 +127,25 @@
                     </select>
                 </div>
 
-                <div class="form-row">
+                <div class="form-group">
+                    <label>Report Period</label>
+                    <div style="display:flex; gap:1rem; margin-bottom:0.75rem;">
+                        <label style="font-weight:normal; cursor:pointer;">
+                            <input type="radio" name="periodMode" value="monthly" checked onchange="togglePeriod()"> Monthly
+                        </label>
+                        <label style="font-weight:normal; cursor:pointer;">
+                            <input type="radio" name="periodMode" value="weekly" onchange="togglePeriod()"> Weekly
+                        </label>
+                        <label style="font-weight:normal; cursor:pointer;">
+                            <input type="radio" name="periodMode" value="custom" onchange="togglePeriod()"> Custom
+                        </label>
+                    </div>
+                </div>
+
+                <div id="periodMonthly" class="form-row">
                     <div class="form-group">
                         <label for="month">Month</label>
-                        <select id="month" required>
+                        <select id="month">
                             {% for num, name in months %}
                             <option value="{{ num }}" {% if num == current_month %}selected{% endif %}>
                                 {{ '%02d' % num }} — {{ name }}
@@ -140,11 +155,33 @@
                     </div>
                     <div class="form-group">
                         <label for="year">Year</label>
-                        <select id="year" required>
+                        <select id="year">
                             {% for y in years %}
                             <option value="{{ y }}" {% if y == current_year %}selected{% endif %}>{{ y }}</option>
                             {% endfor %}
                         </select>
+                    </div>
+                </div>
+
+                <div id="periodWeekly" style="display:none;" class="form-row">
+                    <div class="form-group">
+                        <label for="weekStart">Week Start</label>
+                        <input type="date" id="weekStart" />
+                    </div>
+                    <div class="form-group">
+                        <label for="weekEnd">Week End</label>
+                        <input type="date" id="weekEnd" />
+                    </div>
+                </div>
+
+                <div id="periodCustom" style="display:none;" class="form-row">
+                    <div class="form-group">
+                        <label for="customStart">Start Date</label>
+                        <input type="date" id="customStart" />
+                    </div>
+                    <div class="form-group">
+                        <label for="customEnd">End Date</label>
+                        <input type="date" id="customEnd" />
                     </div>
                 </div>
 
@@ -199,6 +236,30 @@
         }
         loadGroups();
 
+        // Set default week dates
+        function setDefaultWeek() {
+            const now = new Date();
+            const day = now.getDay(); // 0=Sun
+            const monday = new Date(now);
+            monday.setDate(now.getDate() - (day === 0 ? 6 : day - 1));
+            const sunday = new Date(monday);
+            sunday.setDate(monday.getDate() + 6);
+            document.getElementById('weekStart').value = monday.toISOString().split('T')[0];
+            document.getElementById('weekEnd').value = sunday.toISOString().split('T')[0];
+        }
+        setDefaultWeek();
+
+        // Set default custom dates
+        document.getElementById('customStart').value = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0];
+        document.getElementById('customEnd').value = new Date().toISOString().split('T')[0];
+
+        function togglePeriod() {
+            const mode = document.querySelector('input[name="periodMode"]:checked').value;
+            document.getElementById('periodMonthly').style.display = mode === 'monthly' ? 'flex' : 'none';
+            document.getElementById('periodWeekly').style.display = mode === 'weekly' ? 'flex' : 'none';
+            document.getElementById('periodCustom').style.display = mode === 'custom' ? 'flex' : 'none';
+        }
+
         function showStatus(msg, type) {
             statusDiv.textContent = msg;
             statusDiv.className = 'alert alert-' + type;
@@ -214,8 +275,31 @@
 
             const groupId = groupSelect.value;
             const groupName = groupSelect.options[groupSelect.selectedIndex]?.text || '';
-            const month = document.getElementById('month').value;
-            const year = document.getElementById('year').value;
+            const mode = document.querySelector('input[name="periodMode"]:checked').value;
+
+            let body;
+            if (mode === 'monthly') {
+                body = {
+                    id_group: parseInt(groupId),
+                    group_name: groupName.split(' (')[0],
+                    year: parseInt(document.getElementById('year').value),
+                    month: parseInt(document.getElementById('month').value),
+                };
+            } else if (mode === 'weekly') {
+                body = {
+                    id_group: parseInt(groupId),
+                    group_name: groupName.split(' (')[0],
+                    date_start: document.getElementById('weekStart').value,
+                    date_end: document.getElementById('weekEnd').value,
+                };
+            } else { // custom
+                body = {
+                    id_group: parseInt(groupId),
+                    group_name: groupName.split(' (')[0],
+                    date_start: document.getElementById('customStart').value,
+                    date_end: document.getElementById('customEnd').value,
+                };
+            }
 
             if (!groupId) {
                 showStatus('Please select a tenant/group.', 'error');
@@ -231,12 +315,7 @@
                 const resp = await fetch('/api/report/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        id_group: parseInt(groupId),
-                        group_name: groupName.split(' (')[0],
-                        year: parseInt(year),
-                        month: parseInt(month),
-                    }),
+                    body: JSON.stringify(body),
                 });
 
                 let data;

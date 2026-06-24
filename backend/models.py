@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 # ── Request ─────────────────────────────────────────────────────────────────
 
 class ReportRequest(BaseModel):
-    """Request to generate a monthly report."""
+    """Request to generate a report."""
 
     id_group: int = Field(
         ...,
@@ -31,16 +31,24 @@ class ReportRequest(BaseModel):
         description="Display name of the group (for report cover)",
     )
     year: int = Field(
-        ...,
-        description="Report year, e.g. 2026",
-        ge=2020,
+        default=0,
+        description="Report year, e.g. 2026 (0 = use custom dates)",
+        ge=0,
         le=2100,
     )
     month: int = Field(
-        ...,
-        description="Report month, 1–12",
-        ge=1,
+        default=0,
+        description="Report month, 1–12 (0 = use custom dates)",
+        ge=0,
         le=12,
+    )
+    date_start: str = Field(
+        default="",
+        description="Custom start date YYYY-MM-DD (used when month=0)",
+    )
+    date_end: str = Field(
+        default="",
+        description="Custom end date YYYY-MM-DD (used when month=0)",
     )
 
 

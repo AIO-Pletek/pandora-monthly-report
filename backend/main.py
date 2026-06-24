@@ -164,20 +164,32 @@ async def list_groups():
 
 @app.post("/api/report/generate", response_model=ReportResponse)
 async def generate_report(req: ReportRequest):
-    """Generate a monthly Resources Usage Metric Report.
+    """Generate a Resources Usage Metric Report.
 
     1. Fetch agents for the group.
-    2. Discover metric modules per agent (sequential ID scan).
+    2. Discover metric modules per agent.
     3. Build the .docx report with per-VM charts.
     """
     client = _get_client()
 
-    # Build date range
-    year = req.year
-    month = req.month
-    last_day = calendar.monthrange(year, month)[1]
-    month_name = calendar.month_name[month]
-    period = f"{month_name} {year}"
+    # Build date range — monthly or custom
+    if req.month > 0 and req.year > 0:
+        # Monthly report
+        last_day = calendar.monthrange(req.year, req.month)[1]
+        date_start = f"{req.year:04d}-{req.month:02d}-01"
+        date_end = f"{req.year:04d}-{req.month:02d}-{last_day:02d}"
+        month_name = calendar.month_name[req.month]
+        period = f"{month_name} {req.year}"
+    elif req.date_start and req.date_end:
+        # Custom date range (weekly, daily, etc.)
+        date_start = req.date_start
+        date_end = req.date_end
+        period = f"{date_start} to {date_end}"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either (year+month) or (date_start+date_end)."
+        )
     group_name = req.group_name or f"Group {req.id_group}"
 
     logger.info(
