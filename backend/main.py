@@ -200,14 +200,18 @@ async def generate_report(req: ReportRequest):
                 message="No agents found in this group for the selected period.",
             )
 
-        # 2. Discover metric modules for each agent
+        # 2. Discover metric modules for each agent (with per-agent error handling)
         agent_modules_map: dict[int, list[dict]] = {}
         for agent in agents:
             aid = agent.get("id_agente")
             if aid is None:
                 continue
             aid_int = int(aid)
-            mods = await client.discover_agent_modules(aid_int)
+            try:
+                mods = await client.discover_agent_modules(aid_int)
+            except Exception as e:
+                logger.error("Agent %d discovery failed: %s", aid_int, e)
+                mods = []
             if mods:
                 agent_modules_map[aid_int] = mods
                 logger.info(

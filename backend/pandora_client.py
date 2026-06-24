@@ -244,8 +244,8 @@ class PandoraClient:
             if csv_data:
                 return csv_data
             raise PandoraAPIError(
-                f"Pandora returned unrecognized format for op2={op2}: "
-                f"{text[:500]}"
+                f"Pandora returned non-JSON response for op2={op2} "
+                f"(status={resp.status_code}): {text[:100]}"
             )
 
         # Check for error responses disguised as JSON:
